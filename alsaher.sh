@@ -29,12 +29,272 @@ INSTALL_DIR="/etc/alsaher"
 LOG_FILE="/root/log-install.txt"
 DOMAIN_FILE="$INSTALL_DIR/domain"
 SLOWDNS_FILE="$INSTALL_DIR/slowdns_domain"
+FIRST_RUN_FLAG="$INSTALL_DIR/config/.first_run_done"
 
 # ─── Root Check ────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && { echo -e "${RED}Error: Run as root!${NC}"; exit 1; }
 
 # ─── Init Directories ──────────────────────────────────────────
 mkdir -p $INSTALL_DIR/{ssh,xray,l2tp,noobz,backup,config,logs}
+
+# ══════════════════════════════════════════════════════════════
+# FIRST RUN — AUTO INSTALL ALL SERVICES
+# ══════════════════════════════════════════════════════════════
+first_run_install() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}  ${WHITE}ALSAHER VPN — FIRST TIME SETUP          ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}يبدو هذا أول تشغيل للسكريبت!${NC}           ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  هل تريد تنصيب جميع الخدمات الآن؟       ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${LGREEN}[1]${NC} نعم — نصّب كل الخدمات تلقائياً       ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${LGREEN}[2]${NC} لا — تخطى وانتقل للقائمة الرئيسية    ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    read -p "اختر [1/2]: " choice
+
+    case $choice in
+        1)
+            _do_full_install
+            ;;
+        2)
+            echo -e " ${YELLOW}تم التخطي. يمكنك التنصيب لاحقاً من قائمة [10]${NC}"
+            sleep 2
+            ;;
+        *)
+            echo -e "${RED}خيار غير صالح، تم التخطي.${NC}"
+            sleep 2
+            ;;
+    esac
+
+    # Mark first run as done
+    touch "$FIRST_RUN_FLAG"
+}
+
+_do_full_install() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}  ${WHITE}FULL AUTO INSTALL — جاري التنصيب ...    ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo "" | tee -a $LOG_FILE
+    echo "=== ALSAHER FULL INSTALL — $(date) ===" >> $LOG_FILE
+
+    # ── 0. Prepare system ──────────────────────────────────────
+    _log_step "تحديث النظام (apt update & upgrade)..."
+    apt-get update -y >> $LOG_FILE 2>&1
+    apt-get upgrade -y >> $LOG_FILE 2>&1
+    apt-get install -y curl wget git unzip tar openssl gnupg2 lsb-release \
+        ca-certificates software-properties-common apt-transport-https \
+        net-tools iptables iproute2 cron python3 python3-pip >> $LOG_FILE 2>&1
+    _log_ok "System base packages"
+
+    # ── 1. OpenSSH ──────────────────────────────────────────────
+    _log_step "تنصيب OpenSSH Server..."
+    apt-get install -y openssh-server >> $LOG_FILE 2>&1
+    systemctl enable ssh >> $LOG_FILE 2>&1
+    systemctl start  ssh >> $LOG_FILE 2>&1
+    _log_ok "OpenSSH Server"
+
+    # ── 2. Dropbear ─────────────────────────────────────────────
+    _log_step "تنصيب Dropbear SSH..."
+    apt-get install -y dropbear >> $LOG_FILE 2>&1
+    sed -i 's/NO_START=1/NO_START=0/' /etc/default/dropbear 2>/dev/null
+    sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=109/' /etc/default/dropbear 2>/dev/null
+    systemctl enable dropbear >> $LOG_FILE 2>&1
+    systemctl restart dropbear >> $LOG_FILE 2>&1
+    _log_ok "Dropbear SSH (port 109)"
+
+    # ── 3. Stunnel5 ─────────────────────────────────────────────
+    _log_step "تنصيب Stunnel5 (SSL Tunnel)..."
+    apt-get install -y stunnel4 >> $LOG_FILE 2>&1
+    sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4 2>/dev/null
+    # Basic stunnel config if missing
+    if [ ! -f /etc/stunnel/stunnel.conf ]; then
+        cat > /etc/stunnel/stunnel.conf <<'SEOF'
+cert = /etc/stunnel/stunnel.pem
+socket = a:SO_REUSEADDR=1
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+[ssh-ssl]
+accept  = 443
+connect = 127.0.0.1:22
+SEOF
+        openssl req -new -x509 -days 3650 -nodes \
+            -out /etc/stunnel/stunnel.pem \
+            -keyout /etc/stunnel/stunnel.pem \
+            -subj "/CN=alsaher-vpn" >> $LOG_FILE 2>&1
+    fi
+    systemctl enable stunnel4 >> $LOG_FILE 2>&1
+    systemctl restart stunnel4 >> $LOG_FILE 2>&1
+    _log_ok "Stunnel5 (port 443)"
+
+    # ── 4. OpenVPN ──────────────────────────────────────────────
+    _log_step "تنصيب OpenVPN..."
+    apt-get install -y openvpn >> $LOG_FILE 2>&1
+    systemctl enable openvpn >> $LOG_FILE 2>&1
+    _log_ok "OpenVPN"
+
+    # ── 5. Xray Core ────────────────────────────────────────────
+    _log_step "تنصيب Xray Core..."
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> $LOG_FILE 2>&1
+    systemctl enable xray >> $LOG_FILE 2>&1
+    systemctl start  xray >> $LOG_FILE 2>&1
+    _log_ok "Xray Core"
+
+    # ── 6. L2TP / IPSec ─────────────────────────────────────────
+    _log_step "تنصيب L2TP / IPSec..."
+    apt-get install -y xl2tpd strongswan >> $LOG_FILE 2>&1
+    systemctl enable xl2tpd >> $LOG_FILE 2>&1
+    _log_ok "L2TP / IPSec (xl2tpd + strongswan)"
+
+    # ── 7. WireGuard ────────────────────────────────────────────
+    _log_step "تنصيب WireGuard..."
+    apt-get install -y wireguard >> $LOG_FILE 2>&1
+    _log_ok "WireGuard"
+
+    # ── 8. Squid Proxy ──────────────────────────────────────────
+    _log_step "تنصيب Squid Proxy..."
+    apt-get install -y squid >> $LOG_FILE 2>&1
+    systemctl enable squid >> $LOG_FILE 2>&1
+    systemctl start  squid >> $LOG_FILE 2>&1
+    _log_ok "Squid Proxy (port 3128)"
+
+    # ── 9. BadVPN (UDPGW) ───────────────────────────────────────
+    _log_step "تنصيب BadVPN UDPGW..."
+    if ! command -v badvpn-udpgw &>/dev/null; then
+        apt-get install -y cmake make gcc >> $LOG_FILE 2>&1
+        cd /tmp
+        git clone https://github.com/ambrop72/badvpn.git >> $LOG_FILE 2>&1
+        cd badvpn
+        cmake . -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >> $LOG_FILE 2>&1
+        make install >> $LOG_FILE 2>&1
+        cd /root
+    fi
+    # Create systemd service for badvpn
+    cat > /etc/systemd/system/badvpn.service <<'BEOF'
+[Unit]
+Description=BadVPN UDPGW
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+BEOF
+    systemctl daemon-reload >> $LOG_FILE 2>&1
+    systemctl enable badvpn >> $LOG_FILE 2>&1
+    systemctl start  badvpn >> $LOG_FILE 2>&1
+    _log_ok "BadVPN UDPGW (port 7300)"
+
+    # ── 10. Nginx ───────────────────────────────────────────────
+    _log_step "تنصيب Nginx..."
+    apt-get install -y nginx >> $LOG_FILE 2>&1
+    systemctl enable nginx >> $LOG_FILE 2>&1
+    systemctl start  nginx >> $LOG_FILE 2>&1
+    _log_ok "Nginx"
+
+    # ── 11. Certbot ─────────────────────────────────────────────
+    _log_step "تنصيب Certbot (SSL)..."
+    apt-get install -y certbot python3-certbot-nginx >> $LOG_FILE 2>&1
+    _log_ok "Certbot"
+
+    # ── 12. Fail2Ban ────────────────────────────────────────────
+    _log_step "تنصيب Fail2Ban..."
+    apt-get install -y fail2ban >> $LOG_FILE 2>&1
+    systemctl enable fail2ban >> $LOG_FILE 2>&1
+    systemctl start  fail2ban >> $LOG_FILE 2>&1
+    _log_ok "Fail2Ban"
+
+    # ── 13. vnStat ──────────────────────────────────────────────
+    _log_step "تنصيب vnStat..."
+    apt-get install -y vnstat >> $LOG_FILE 2>&1
+    systemctl enable vnstat >> $LOG_FILE 2>&1
+    systemctl start  vnstat >> $LOG_FILE 2>&1
+    _log_ok "vnStat"
+
+    # ── 14. Speedtest CLI ───────────────────────────────────────
+    _log_step "تنصيب Speedtest CLI..."
+    pip3 install speedtest-cli --break-system-packages >> $LOG_FILE 2>&1 || \
+    apt-get install -y speedtest-cli >> $LOG_FILE 2>&1
+    _log_ok "Speedtest CLI"
+
+    # ── 15. UFW Firewall ────────────────────────────────────────
+    _log_step "تنصيب وإعداد UFW Firewall..."
+    apt-get install -y ufw >> $LOG_FILE 2>&1
+    ufw --force reset >> $LOG_FILE 2>&1
+    ufw default deny incoming >> $LOG_FILE 2>&1
+    ufw default allow outgoing >> $LOG_FILE 2>&1
+    # Allow all VPN ports
+    for port in 22 80 109 143 443 442 1194 2052 2095 2200 3128 7100 7200 7300 8080 8880 10000; do
+        ufw allow $port >> $LOG_FILE 2>&1
+    done
+    ufw --force enable >> $LOG_FILE 2>&1
+    _log_ok "UFW Firewall (all VPN ports opened)"
+
+    # ── 16. Websocat (SSH Websocket) ────────────────────────────
+    _log_step "تنصيب Websocat (SSH Websocket)..."
+    WS_URL="https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl"
+    curl -L "$WS_URL" -o /usr/local/bin/websocat >> $LOG_FILE 2>&1
+    chmod +x /usr/local/bin/websocat
+    _log_ok "Websocat"
+
+    # ── 17. RC-Local ────────────────────────────────────────────
+    _log_step "تفعيل RC-Local..."
+    if [ ! -f /etc/rc.local ]; then
+        echo '#!/bin/bash' > /etc/rc.local
+        echo 'exit 0' >> /etc/rc.local
+        chmod +x /etc/rc.local
+    fi
+    cat > /etc/systemd/system/rc-local.service <<'RCEOF'
+[Unit]
+Description=RC Local Compatibility
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/etc/rc.local start
+TimeoutSec=0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RCEOF
+    systemctl daemon-reload >> $LOG_FILE 2>&1
+    systemctl enable rc-local >> $LOG_FILE 2>&1
+    _log_ok "RC-Local"
+
+    # ── 18. IP Forwarding & Kernel Tweaks ───────────────────────
+    _log_step "إعداد IP Forwarding وتحسينات الكيرنل..."
+    sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf 2>/dev/null
+    sysctl -p >> $LOG_FILE 2>&1
+    _log_ok "IP Forwarding & Kernel Tweaks"
+
+    echo ""
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${GREEN}✓ تم تنصيب جميع الخدمات بنجاح!${NC}         ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  📄 السجل: ${YELLOW}$LOG_FILE${NC}               ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+    press_enter
+}
+
+_log_step() {
+    echo -e " ${YELLOW}▶${NC} $1"
+    echo "[INFO] $1" >> $LOG_FILE
+}
+
+_log_ok() {
+    echo -e " ${GREEN}✓${NC} $1 — ${GREEN}OK${NC}"
+    echo "[OK] $1" >> $LOG_FILE
+}
+
+_log_fail() {
+    echo -e " ${RED}✗${NC} $1 — ${RED}FAILED${NC}"
+    echo "[FAIL] $1" >> $LOG_FILE
+}
 
 # ══════════════════════════════════════════════════════════════
 # SYSTEM INFO
@@ -64,7 +324,7 @@ count_accounts() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# HEADER — مطابق للصورة تماماً
+# HEADER
 # ══════════════════════════════════════════════════════════════
 show_header() {
     clear
@@ -110,33 +370,35 @@ main_menu() {
         echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
         printf  "${BLUE}║${NC}              ${WHITE}MAIN MENU${NC}%-15s${BLUE}║${NC}\n" ""
         echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}1.${NC} MENU SSH & OVPN                       ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}2.${NC} MENU XRAY                             ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC} MENU L2TP                             ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}4.${NC} MENU NOOBZVPNS                        ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC} SETTINGS                              ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC} ON/OFF SERVICES                       ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC} STATUS SERVICES                       ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC} UPDATE SCRIPT                         ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC} STATUS SCRIPT                         ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${RED}0.${NC} Exit                                  ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}1.${NC}  MENU SSH & OVPN                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}2.${NC}  MENU XRAY                            ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC}  MENU L2TP                            ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}4.${NC}  MENU NOOBZVPNS                       ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC}  SETTINGS                             ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC}  ON/OFF SERVICES                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC}  STATUS SERVICES                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC}  UPDATE SCRIPT                        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC}  STATUS SCRIPT                        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}10.${NC} INSTALL / REMOVE SERVICES            ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${RED}0.${NC}  Exit                                 ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC} EXP SCRIPT: ${YELLOW}$EXP_DATE ($EXP_DAYS days)${NC}  ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} REGIST BY : ${YELLOW}$REGIST_BY (id telegram)${NC}  ${BLUE}║${NC}"
         echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-        read -p "Please select an option [0-9]: " opt
+        read -p "Please select an option [0-10]: " opt
         case $opt in
-            1) ssh_menu ;;
-            2) xray_menu ;;
-            3) l2tp_menu ;;
-            4) noobz_menu ;;
-            5) settings_menu ;;
-            6) services_toggle_menu ;;
-            7) status_services ;;
-            8) update_script ;;
-            9) status_script ;;
-            0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
-            *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
+            1)  ssh_menu ;;
+            2)  xray_menu ;;
+            3)  l2tp_menu ;;
+            4)  noobz_menu ;;
+            5)  settings_menu ;;
+            6)  services_toggle_menu ;;
+            7)  status_services ;;
+            8)  update_script ;;
+            9)  status_script ;;
+            10) install_menu ;;
+            0)  echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *)  echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -160,6 +422,455 @@ menu_footer() {
 confirm_action() {
     read -p "$1 [y/n]: " c
     [[ "$c" =~ ^[Yy]$ ]]
+}
+
+# ══════════════════════════════════════════════════════════════
+# ██████  INSTALL / REMOVE SERVICES MENU
+# ══════════════════════════════════════════════════════════════
+
+# Check if a package/command is installed
+_is_installed() {
+    local name="$1"
+    command -v "$name" &>/dev/null && return 0
+    dpkg -l "$name" &>/dev/null 2>&1 && return 0
+    systemctl list-unit-files 2>/dev/null | grep -q "^${name}.service" && return 0
+    return 1
+}
+
+# Badge: show green INSTALLED or red NOT INSTALLED
+_badge() {
+    if _is_installed "$1"; then
+        printf "${GREEN}[INSTALLED]${NC}"
+    else
+        printf "${RED}[NOT SET]${NC}   "
+    fi
+}
+
+install_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+        printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "INSTALL / REMOVE SERVICES"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        printf  "${BLUE}║${NC} ${PURPLE}► SSH & TUNNELING${NC}%-25s${BLUE}║${NC}\n" ""
+        printf  "${BLUE}║${NC}  ${LGREEN}[1]${NC}  OpenSSH Server          $(_badge ssh)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[2]${NC}  Dropbear SSH            $(_badge dropbear)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[3]${NC}  Stunnel5 (SSL Tunnel)   $(_badge stunnel4)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[4]${NC}  SSH Websocket (websocat) $(_badge websocat)  ${BLUE}║${NC}\n"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        printf  "${BLUE}║${NC} ${PURPLE}► VPN SERVICES${NC}%-27s${BLUE}║${NC}\n" ""
+        printf  "${BLUE}║${NC}  ${LGREEN}[5]${NC}  OpenVPN                 $(_badge openvpn)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[6]${NC}  Xray Core               $(_badge xray)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[7]${NC}  L2TP / IPSec (xl2tpd)  $(_badge xl2tpd)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[8]${NC}  WireGuard               $(_badge wg)   ${BLUE}║${NC}\n"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        printf  "${BLUE}║${NC} ${PURPLE}► PROXY & DNS${NC}%-28s${BLUE}║${NC}\n" ""
+        printf  "${BLUE}║${NC}  ${LGREEN}[9]${NC}  Squid Proxy             $(_badge squid)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[10]${NC} SlowDNS                 $(_badge dns-over-https)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[11]${NC} BadVPN UDPGW            $(_badge badvpn-udpgw)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[12]${NC} Cloudflare WARP         $(_badge warp-cli)   ${BLUE}║${NC}\n"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        printf  "${BLUE}║${NC} ${PURPLE}► WEB & MONITORING${NC}%-23s${BLUE}║${NC}\n" ""
+        printf  "${BLUE}║${NC}  ${LGREEN}[13]${NC} Nginx Web Server        $(_badge nginx)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[14]${NC} Certbot SSL             $(_badge certbot)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[15]${NC} Fail2Ban                $(_badge fail2ban)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[16]${NC} Webmin                  $(_badge webmin)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[17]${NC} vnStat Bandwidth Mon.   $(_badge vnstat)   ${BLUE}║${NC}\n"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        printf  "${BLUE}║${NC} ${PURPLE}► UTILITIES${NC}%-30s${BLUE}║${NC}\n" ""
+        printf  "${BLUE}║${NC}  ${LGREEN}[18]${NC} Speedtest CLI           $(_badge speedtest-cli)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[19]${NC} UFW Firewall            $(_badge ufw)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[20]${NC} Net-Tools               $(_badge net-tools)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[21]${NC} Python3 & PIP3          $(_badge python3)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[22]${NC} Iptables                $(_badge iptables)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[23]${NC} RC-Local                $(_badge rc-local)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[24]${NC} Cron                    $(_badge cron)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[25]${NC} TC Traffic Control      $(_badge tc)   ${BLUE}║${NC}\n"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC}  ${RED}[0]${NC}  Back to Main Menu                   ${BLUE}║${NC}"
+        echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+
+        read -p "Select service [0-25]: " opt
+        case $opt in
+            1)  _svc_menu "OpenSSH Server"       "openssh-server"  "ssh"           "_apt_install"  ;;
+            2)  _svc_menu "Dropbear SSH"         "dropbear"        "dropbear"      "_install_dropbear_full" ;;
+            3)  _svc_menu "Stunnel5"             "stunnel4"        "stunnel4"      "_install_stunnel_full" ;;
+            4)  _svc_menu "SSH Websocket"        "websocat"        ""              "_install_websocat_full" ;;
+            5)  _svc_menu "OpenVPN"              "openvpn"         "openvpn"       "_install_openvpn_full" ;;
+            6)  _svc_menu "Xray Core"            "xray"            "xray"          "_install_xray_full" ;;
+            7)  _svc_menu "L2TP / IPSec"         "xl2tpd"          "xl2tpd"        "_install_l2tp_full" ;;
+            8)  _svc_menu "WireGuard"            "wireguard"       "wg-quick@wg0"  "_apt_install" ;;
+            9)  _svc_menu "Squid Proxy"          "squid"           "squid"         "_apt_install" ;;
+            10) _svc_menu "SlowDNS"              "dns-over-https"  "dns-over-https" "_install_slowdns_full" ;;
+            11) _svc_menu "BadVPN UDPGW"         "badvpn-udpgw"   "badvpn"        "_install_badvpn_full" ;;
+            12) _svc_menu "Cloudflare WARP"      "warp-cli"        "warp-svc"      "_install_warp_full" ;;
+            13) _svc_menu "Nginx"                "nginx"           "nginx"         "_apt_install" ;;
+            14) _svc_menu "Certbot SSL"          "certbot"         ""              "_install_certbot_full" ;;
+            15) _svc_menu "Fail2Ban"             "fail2ban"        "fail2ban"      "_apt_install" ;;
+            16) _svc_menu "Webmin"               "webmin"          "webmin"        "_install_webmin_full" ;;
+            17) _svc_menu "vnStat"               "vnstat"          "vnstat"        "_apt_install" ;;
+            18) _svc_menu "Speedtest CLI"        "speedtest-cli"   ""              "_install_speedtest_full" ;;
+            19) _svc_menu "UFW Firewall"         "ufw"             "ufw"           "_install_ufw_full" ;;
+            20) _svc_menu "Net-Tools"            "net-tools"       ""              "_apt_install" ;;
+            21) _svc_menu "Python3 & PIP3"       "python3"         ""              "_install_python_full" ;;
+            22) _svc_menu "Iptables"             "iptables"        ""              "_apt_install" ;;
+            23) _svc_menu "RC-Local"             "rc-local"        "rc-local"      "_install_rclocal_full" ;;
+            24) _svc_menu "Cron"                 "cron"            "cron"          "_apt_install" ;;
+            25) _svc_menu "TC Traffic Control"   "iproute2"        ""              "_apt_install" ;;
+            0) break ;;
+            *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ══════════════════════════════════════════════════════════════
+# SERVICE INSTALL/REMOVE DIALOG
+# pkg=$2 = apt package name OR command name
+# svc=$3 = systemd service name
+# fn=$4  = custom install function name (or "_apt_install" for simple ones)
+# ══════════════════════════════════════════════════════════════
+_svc_menu() {
+    local label="$1"
+    local pkg="$2"
+    local svc="$3"
+    local install_fn="$4"
+
+    menu_header "MANAGE — $label"
+    echo ""
+
+    if _is_installed "$pkg"; then
+        echo -e " ${GREEN}● الحالة: مثبّت (INSTALLED)${NC}"
+        echo ""
+        echo -e " ${LGREEN}[1]${NC} إعادة تثبيت / تحديث"
+        echo -e " ${RED}[2]${NC} حذف (Remove)"
+        echo -e " ${YELLOW}[0]${NC} رجوع"
+        echo ""
+        read -p " اختر [0-2]: " c
+        case $c in
+            1)
+                _log_step "إعادة تثبيت $label..."
+                $install_fn "$pkg" "$svc"
+                ;;
+            2)
+                confirm_action " تأكيد حذف $label?" || { echo "Cancelled."; sleep 1; return; }
+                _remove_service "$pkg" "$svc" "$label"
+                ;;
+            0) return ;;
+        esac
+    else
+        echo -e " ${RED}● الحالة: غير مثبّت (NOT INSTALLED)${NC}"
+        echo ""
+        echo -e " ${LGREEN}[1]${NC} تثبيت الآن (Install)"
+        echo -e " ${YELLOW}[0]${NC} رجوع"
+        echo ""
+        read -p " اختر [0-1]: " c
+        case $c in
+            1)
+                _log_step "تثبيت $label..."
+                $install_fn "$pkg" "$svc"
+                ;;
+            0) return ;;
+        esac
+    fi
+    echo ""
+    menu_footer
+    press_enter
+}
+
+# ──────────────────────────────────────────────────────────────
+# REMOVE a service
+# ──────────────────────────────────────────────────────────────
+_remove_service() {
+    local pkg="$1"
+    local svc="$2"
+    local label="$3"
+    [ -n "$svc" ] && {
+        systemctl stop    "$svc" 2>/dev/null
+        systemctl disable "$svc" 2>/dev/null
+    }
+    apt-get purge -y "$pkg" >> $LOG_FILE 2>&1
+    apt-get autoremove -y   >> $LOG_FILE 2>&1
+    echo -e " ${GREEN}✓ تم حذف $label بنجاح${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────
+# GENERIC APT INSTALL + enable/start service
+# ──────────────────────────────────────────────────────────────
+_apt_install() {
+    local pkg="$1"
+    local svc="$2"
+    apt-get update -y >> $LOG_FILE 2>&1
+    apt-get install -y "$pkg" >> $LOG_FILE 2>&1
+    [ -n "$svc" ] && {
+        systemctl enable "$svc" >> $LOG_FILE 2>&1
+        systemctl start  "$svc" >> $LOG_FILE 2>&1
+    }
+    _log_ok "$pkg"
+}
+
+# ──────────────────────────────────────────────────────────────
+# DROPBEAR — custom install (set ports)
+# ──────────────────────────────────────────────────────────────
+_install_dropbear_full() {
+    apt-get install -y dropbear >> $LOG_FILE 2>&1
+    sed -i 's/NO_START=1/NO_START=0/'   /etc/default/dropbear 2>/dev/null
+    sed -i 's/DROPBEAR_EXTRA_ARGS=.*/DROPBEAR_EXTRA_ARGS="-p 109 -p 143"/' /etc/default/dropbear 2>/dev/null
+    grep -q "DROPBEAR_EXTRA_ARGS" /etc/default/dropbear || \
+        echo 'DROPBEAR_EXTRA_ARGS="-p 109 -p 143"' >> /etc/default/dropbear
+    systemctl enable dropbear >> $LOG_FILE 2>&1
+    systemctl restart dropbear >> $LOG_FILE 2>&1
+    _log_ok "Dropbear (ports 109, 143)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# STUNNEL5 — custom install (auto generate cert)
+# ──────────────────────────────────────────────────────────────
+_install_stunnel_full() {
+    apt-get install -y stunnel4 >> $LOG_FILE 2>&1
+    sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4 2>/dev/null
+    if [ ! -f /etc/stunnel/stunnel.pem ]; then
+        openssl req -new -x509 -days 3650 -nodes \
+            -out /etc/stunnel/stunnel.pem \
+            -keyout /etc/stunnel/stunnel.pem \
+            -subj "/CN=alsaher-vpn" >> $LOG_FILE 2>&1
+    fi
+    cat > /etc/stunnel/stunnel.conf <<'EOF'
+cert = /etc/stunnel/stunnel.pem
+socket = a:SO_REUSEADDR=1
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+[ssh-ssl]
+accept  = 443
+connect = 127.0.0.1:22
+[dropbear-ssl]
+accept  = 444
+connect = 127.0.0.1:109
+EOF
+    systemctl enable stunnel4 >> $LOG_FILE 2>&1
+    systemctl restart stunnel4 >> $LOG_FILE 2>&1
+    _log_ok "Stunnel5 (port 443, 444)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# WEBSOCAT — SSH Websocket
+# ──────────────────────────────────────────────────────────────
+_install_websocat_full() {
+    WS_URL="https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl"
+    curl -L "$WS_URL" -o /usr/local/bin/websocat >> $LOG_FILE 2>&1
+    chmod +x /usr/local/bin/websocat
+    # Create systemd service
+    cat > /etc/systemd/system/ssh-ws.service <<'EOF'
+[Unit]
+Description=SSH Websocket Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/websocat -t --binary ws-l:0.0.0.0:2052 tcp:127.0.0.1:22
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >> $LOG_FILE 2>&1
+    systemctl enable ssh-ws >> $LOG_FILE 2>&1
+    systemctl start  ssh-ws >> $LOG_FILE 2>&1
+    _log_ok "SSH Websocket (port 2052)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# OPENVPN — install + basic config
+# ──────────────────────────────────────────────────────────────
+_install_openvpn_full() {
+    apt-get install -y openvpn easy-rsa >> $LOG_FILE 2>&1
+    systemctl enable openvpn >> $LOG_FILE 2>&1
+    _log_ok "OpenVPN"
+    echo -e " ${YELLOW}ℹ لتشغيل OpenVPN يجب إعداد ملف config.ovpn${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────
+# XRAY — install from official script
+# ──────────────────────────────────────────────────────────────
+_install_xray_full() {
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> $LOG_FILE 2>&1
+    systemctl enable xray >> $LOG_FILE 2>&1
+    systemctl start  xray >> $LOG_FILE 2>&1
+    _log_ok "Xray Core"
+}
+
+# ──────────────────────────────────────────────────────────────
+# L2TP / IPSec
+# ──────────────────────────────────────────────────────────────
+_install_l2tp_full() {
+    apt-get install -y xl2tpd strongswan ppp >> $LOG_FILE 2>&1
+    # xl2tpd basic config
+    [ ! -f /etc/xl2tpd/xl2tpd.conf ] && cat > /etc/xl2tpd/xl2tpd.conf <<'EOF'
+[global]
+ipsec saref = yes
+[lns default]
+ip range = 192.168.100.10-192.168.100.100
+local ip = 192.168.100.1
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = xl2tpd
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes
+EOF
+    [ ! -f /etc/ppp/options.xl2tpd ] && cat > /etc/ppp/options.xl2tpd <<'EOF'
+require-mschap-v2
+ms-dns 8.8.8.8
+ms-dns 8.8.4.4
+auth
+mtu 1280
+mru 1280
+nodefaultroute
+lock
+proxyarp
+EOF
+    systemctl enable xl2tpd >> $LOG_FILE 2>&1
+    systemctl start  xl2tpd >> $LOG_FILE 2>&1
+    _log_ok "L2TP / IPSec"
+}
+
+# ──────────────────────────────────────────────────────────────
+# BADVPN UDPGW
+# ──────────────────────────────────────────────────────────────
+_install_badvpn_full() {
+    apt-get install -y cmake make gcc git >> $LOG_FILE 2>&1
+    cd /tmp
+    rm -rf badvpn
+    git clone https://github.com/ambrop72/badvpn.git >> $LOG_FILE 2>&1
+    cd badvpn
+    cmake . -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >> $LOG_FILE 2>&1
+    make install >> $LOG_FILE 2>&1
+    cd /root
+    cat > /etc/systemd/system/badvpn.service <<'EOF'
+[Unit]
+Description=BadVPN UDPGW
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >> $LOG_FILE 2>&1
+    systemctl enable badvpn >> $LOG_FILE 2>&1
+    systemctl start  badvpn >> $LOG_FILE 2>&1
+    _log_ok "BadVPN UDPGW (port 7300)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# SLOWDNS
+# ──────────────────────────────────────────────────────────────
+_install_slowdns_full() {
+    read -p " SlowDNS Domain (NS record): " sdomain
+    [ -n "$sdomain" ] && echo "$sdomain" > "$SLOWDNS_FILE"
+    # Placeholder: download actual slowdns binary from your source
+    echo -e " ${YELLOW}ℹ يجب رفع ملف slowdns binary يدوياً إلى /usr/local/bin/slowdns${NC}"
+    _log_ok "SlowDNS config saved"
+}
+
+# ──────────────────────────────────────────────────────────────
+# WARP CLOUDFLARE
+# ──────────────────────────────────────────────────────────────
+_install_warp_full() {
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
+        gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg >> $LOG_FILE 2>&1
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | \
+        tee /etc/apt/sources.list.d/cloudflare-client.list >> $LOG_FILE 2>&1
+    apt-get update -y >> $LOG_FILE 2>&1
+    apt-get install -y cloudflare-warp >> $LOG_FILE 2>&1
+    _log_ok "Cloudflare WARP"
+}
+
+# ──────────────────────────────────────────────────────────────
+# CERTBOT
+# ──────────────────────────────────────────────────────────────
+_install_certbot_full() {
+    apt-get install -y certbot python3-certbot-nginx >> $LOG_FILE 2>&1
+    _log_ok "Certbot"
+    echo -e " ${YELLOW}ℹ لإصدار شهادة: certbot --nginx -d yourdomain.com${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────
+# WEBMIN
+# ──────────────────────────────────────────────────────────────
+_install_webmin_full() {
+    curl -o /tmp/setup-repos.sh \
+        https://raw.githubusercontent.com/webmin/webmin/master/setup-repos.sh >> $LOG_FILE 2>&1
+    bash /tmp/setup-repos.sh --force >> $LOG_FILE 2>&1
+    apt-get install -y webmin >> $LOG_FILE 2>&1
+    systemctl enable webmin >> $LOG_FILE 2>&1
+    systemctl start  webmin >> $LOG_FILE 2>&1
+    _log_ok "Webmin (port 10000)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# SPEEDTEST
+# ──────────────────────────────────────────────────────────────
+_install_speedtest_full() {
+    pip3 install speedtest-cli --break-system-packages >> $LOG_FILE 2>&1 || \
+    apt-get install -y speedtest-cli >> $LOG_FILE 2>&1
+    _log_ok "Speedtest CLI"
+}
+
+# ──────────────────────────────────────────────────────────────
+# UFW — open all needed ports automatically
+# ──────────────────────────────────────────────────────────────
+_install_ufw_full() {
+    apt-get install -y ufw >> $LOG_FILE 2>&1
+    ufw --force reset >> $LOG_FILE 2>&1
+    ufw default deny incoming >> $LOG_FILE 2>&1
+    ufw default allow outgoing >> $LOG_FILE 2>&1
+    for port in 22 80 109 143 443 442 444 1194 2052 2095 2200 3128 7100 7200 7300 8080 8880 10000; do
+        ufw allow $port >> $LOG_FILE 2>&1
+    done
+    ufw allow 500/udp  >> $LOG_FILE 2>&1
+    ufw allow 4500/udp >> $LOG_FILE 2>&1
+    ufw --force enable >> $LOG_FILE 2>&1
+    _log_ok "UFW Firewall (all ports opened)"
+}
+
+# ──────────────────────────────────────────────────────────────
+# PYTHON3
+# ──────────────────────────────────────────────────────────────
+_install_python_full() {
+    apt-get install -y python3 python3-pip >> $LOG_FILE 2>&1
+    _log_ok "Python3 & PIP3"
+}
+
+# ──────────────────────────────────────────────────────────────
+# RC-LOCAL
+# ──────────────────────────────────────────────────────────────
+_install_rclocal_full() {
+    if [ ! -f /etc/rc.local ]; then
+        echo '#!/bin/bash' > /etc/rc.local
+        echo 'exit 0' >> /etc/rc.local
+        chmod +x /etc/rc.local
+    fi
+    cat > /etc/systemd/system/rc-local.service <<'EOF'
+[Unit]
+Description=RC Local Compatibility
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/etc/rc.local start
+TimeoutSec=0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >> $LOG_FILE 2>&1
+    systemctl enable rc-local >> $LOG_FILE 2>&1
+    _log_ok "RC-Local"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -256,7 +967,6 @@ EOF
 
 _ssh_renew() {
     menu_header "RENEW SSH & OVPN"
-    # list current accounts
     if [ "$(ls $INSTALL_DIR/ssh/ 2>/dev/null | wc -l)" -gt 0 ]; then
         echo -e " ${CYAN}Current Accounts:${NC}"
         i=1
@@ -315,7 +1025,6 @@ _ssh_check() {
         for u in $(ls $INSTALL_DIR/ssh/); do
             exp=$(grep "Expires" $INSTALL_DIR/ssh/$u 2>/dev/null | cut -d':' -f2 | xargs)
             maxip=$(grep "Max IP" $INSTALL_DIR/ssh/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "2")
-            # check if expired
             exp_ts=$(date -d "$exp" +%s 2>/dev/null || echo 0)
             today_ts=$(date +%s)
             if [ $exp_ts -lt $today_ts ]; then
@@ -563,7 +1272,6 @@ _xray_check() {
             exp=$(grep "Expires" $INSTALL_DIR/xray/$u 2>/dev/null | cut -d':' -f2 | xargs)
             maxip=$(grep "Max IP" $INSTALL_DIR/xray/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "3")
             quota=$(grep "^Quota" $INSTALL_DIR/xray/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "100 GB")
-            used=$(grep "Used" $INSTALL_DIR/xray/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "0 GB")
             exp_ts=$(date -d "$exp" +%s 2>/dev/null || echo 0)
             if [ $exp_ts -lt $today_ts ]; then st="${RED}Expired${NC}"
             else st="${GREEN}Active${NC}"; fi
@@ -585,15 +1293,14 @@ _xray_path() {
     echo -e " Current VLESS path : ${YELLOW}$vpath${NC}"
     echo -e " Current VMESS path : ${YELLOW}$vmpath${NC}"
     echo ""
-    read -p " New VLESS path (Enter to keep [$vpath]): " new_vpath
-    read -p " New VMESS path (Enter to keep [$vmpath]): " new_vmpath
+    read -p " New VLESS path (Enter to keep): " new_vpath
+    read -p " New VMESS path (Enter to keep): " new_vmpath
     [[ -n "$new_vpath" ]]  && { echo "$new_vpath"  > $INSTALL_DIR/config/vless_path; vpath=$new_vpath; }
     [[ -n "$new_vmpath" ]] && { echo "$new_vmpath" > $INSTALL_DIR/config/vmess_path; vmpath=$new_vmpath; }
-    # Update xray config if exists
-    if [ -f /usr/local/etc/xray/config.json ]; then
+    [ -f /usr/local/etc/xray/config.json ] && {
         sed -i "s|\"path\":.*vless.*|\"path\": \"$vpath\"|g" /usr/local/etc/xray/config.json 2>/dev/null
-        systemctl restart xray 2>/dev/null && echo -e " ${GREEN}✓ XRAY restarted with new paths${NC}"
-    fi
+        systemctl restart xray 2>/dev/null && echo -e " ${GREEN}✓ XRAY restarted${NC}"
+    }
     echo -e " ${GREEN}✓ Paths updated — VLESS: $vpath | VMESS: $vmpath${NC}"
     menu_footer; press_enter
 }
@@ -628,11 +1335,10 @@ _xray_unban_time() {
     menu_header "CUSTOMIZE UNBAN TIME"
     cur=$(cat $INSTALL_DIR/config/xray_bantime 2>/dev/null || echo "3600")
     echo -e " Current ban time: ${YELLOW}$cur seconds${NC} ($(( cur/60 )) minutes)"
-    echo ""
     read -p " New ban time in seconds: " bantime
     [[ ! "$bantime" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid!${NC}"; sleep 2; return; }
     echo "$bantime" > $INSTALL_DIR/config/xray_bantime
-    echo -e " ${GREEN}✓ Ban time set to $bantime seconds ($(( bantime/60 )) minutes)${NC}"
+    echo -e " ${GREEN}✓ Ban time set to $bantime seconds${NC}"
     menu_footer; press_enter
 }
 
@@ -651,7 +1357,7 @@ _xray_expiring() {
     menu_header "LIST USERS EXPIRING WITHIN 3 DAYS"
     echo ""
     today=$(date +%s)
-    limit=$((today + 259200))  # 3 days
+    limit=$((today + 259200))
     found=0
     for dir in ssh xray l2tp; do
         [ ! -d "$INSTALL_DIR/$dir" ] && continue
@@ -685,7 +1391,7 @@ l2tp_menu() {
         echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC} ${LGREEN}1.${NC} Create L2TP                           ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${LGREEN}2.${NC} Renew L2TP                            ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC} del L2TP                              ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC} Delete L2TP                           ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${RED}0.${NC} Back to Main Menu                     ${BLUE}║${NC}"
         echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
         read -p "Please select an option [0-3]: " opt
@@ -751,7 +1457,6 @@ _l2tp_delete() {
     read -p " Username to delete: " user
     [ ! -f "$INSTALL_DIR/l2tp/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
     confirm_action " Delete $user?" || { echo "Cancelled."; sleep 1; return; }
-    pass=$(grep "Password" $INSTALL_DIR/l2tp/$user | cut -d':' -f2 | xargs)
     rm -f $INSTALL_DIR/l2tp/$user
     [ -f /etc/ppp/chap-secrets ] && sed -i "/^$user /d" /etc/ppp/chap-secrets
     echo -e " ${GREEN}✓ L2TP user '$user' deleted!${NC}"
@@ -899,7 +1604,7 @@ _noobz_reset_quota() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████  SETTINGS MENU (28 options)
+# ██████  SETTINGS MENU
 # ══════════════════════════════════════════════════════════════
 settings_menu() {
     while true; do
@@ -978,7 +1683,6 @@ settings_menu() {
     done
 }
 
-# ── Settings Functions ──────────────────────────────────────
 _s_activate_limit() {
     menu_header "ACTIVATE LIMIT IP SSH & XRAY"
     cur=$(cat $INSTALL_DIR/config/limit_ip_status 2>/dev/null || echo "disabled")
@@ -1012,7 +1716,6 @@ _s_bypass_warp() {
     read -p " Choice: " c
     if [ "$c" = "1" ]; then
         echo "enabled" > $INSTALL_DIR/config/warp_bypass
-        # warp-cli mode proxy 2>/dev/null
         echo -e " ${GREEN}✓ WARP bypass enabled${NC}"
     else
         echo "disabled" > $INSTALL_DIR/config/warp_bypass
@@ -1102,8 +1805,8 @@ _s_routing_xray() {
     echo -e " 1. Direct   2. Through WARP   3. Block Bittorrent"
     read -p " Route mode: " mode
     case $mode in
-        1) echo "direct" > $INSTALL_DIR/config/xray_routing ;;
-        2) echo "warp"   > $INSTALL_DIR/config/xray_routing ;;
+        1) echo "direct"   > $INSTALL_DIR/config/xray_routing ;;
+        2) echo "warp"     > $INSTALL_DIR/config/xray_routing ;;
         3) echo "block_bt" > $INSTALL_DIR/config/xray_routing ;;
     esac
     echo -e " ${GREEN}✓ Routing updated${NC}"
@@ -1115,9 +1818,8 @@ _s_warp_cloudflare() {
     echo -e " 1. Install WARP   2. Enable WARP   3. Disable WARP   4. Status"
     read -p " Choice: " c
     case $c in
-        1) curl -fsSL https://pkg.cloudflareclient.com/install.sh 2>/dev/null | bash
-           echo -e " ${GREEN}✓ WARP install initiated${NC}" ;;
-        2) warp-cli connect 2>/dev/null; echo -e " ${GREEN}✓ WARP connected${NC}" ;;
+        1) _install_warp_full ;;
+        2) warp-cli connect 2>/dev/null;    echo -e " ${GREEN}✓ WARP connected${NC}" ;;
         3) warp-cli disconnect 2>/dev/null; echo -e " ${YELLOW}WARP disconnected${NC}" ;;
         4) warp-cli status 2>/dev/null ;;
     esac
@@ -1129,10 +1831,11 @@ _s_autobackup_tg() {
     read -p " Bot Token : " token
     read -p " Chat ID   : " chatid
     [ -z "$token" ] && { echo -e "${RED}Token required!${NC}"; sleep 2; return; }
-    echo "TOKEN=$token"  > $INSTALL_DIR/config/telegram
+    echo "TOKEN=$token"   > $INSTALL_DIR/config/telegram
     echo "CHATID=$chatid" >> $INSTALL_DIR/config/telegram
-    # daily cron at 00:00
-    (crontab -l 2>/dev/null | grep -v "alsaher-backup"; echo "0 0 * * * tar -czf /tmp/als_bak_\$(date +\%Y\%m\%d).tar.gz $INSTALL_DIR && curl -s -F chat_id=$chatid -F document=@/tmp/als_bak_\$(date +\%Y\%m\%d).tar.gz https://api.telegram.org/bot$token/sendDocument") | crontab -
+    (crontab -l 2>/dev/null | grep -v "alsaher-backup"; \
+     echo "0 0 * * * tar -czf /tmp/als_bak_\$(date +\%Y\%m\%d).tar.gz $INSTALL_DIR && curl -s -F chat_id=$chatid -F document=@/tmp/als_bak_\$(date +\%Y\%m\%d).tar.gz https://api.telegram.org/bot$token/sendDocument") \
+    | crontab -
     echo -e " ${GREEN}✓ Auto backup set (daily midnight)${NC}"
     menu_footer; sleep 2
 }
@@ -1143,8 +1846,8 @@ _s_autosend_tg() {
     echo -e " Current: ${YELLOW}$cur${NC}"
     echo -e " 1. Enable   2. Disable"
     read -p " Choice: " c
-    [ "$c" = "1" ] && echo "enabled" > $INSTALL_DIR/config/autosend_status \
-                    || echo "disabled" > $INSTALL_DIR/config/autosend_status
+    [ "$c" = "1" ] && echo "enabled"  > $INSTALL_DIR/config/autosend_status \
+                   || echo "disabled" > $INSTALL_DIR/config/autosend_status
     echo -e " ${GREEN}✓ Auto-send updated${NC}"
     menu_footer; sleep 2
 }
@@ -1195,7 +1898,7 @@ _s_bot_mgmt() {
     read -p " Bot Token   : " token
     read -p " Admin Chat ID: " chatid
     [ -z "$token" ] && { echo -e "${RED}Token required!${NC}"; sleep 2; return; }
-    echo "TOKEN=$token"       > $INSTALL_DIR/config/bot_mgmt
+    echo "TOKEN=$token"         > $INSTALL_DIR/config/bot_mgmt
     echo "ADMIN_CHATID=$chatid" >> $INSTALL_DIR/config/bot_mgmt
     echo -e " ${GREEN}✓ Bot management configured${NC}"
     menu_footer; sleep 2
@@ -1219,10 +1922,9 @@ _s_xanmod_bbrv3() {
     menu_header "CONFIGURASI XANMOD KERNEL & BBRV3"
     echo -e " Current kernel: ${YELLOW}$(uname -r)${NC}"
     confirm_action " Install XanMod + BBRv3?" || { echo "Cancelled."; sleep 1; return; }
-    echo -e " ${YELLOW}Checking CPU compatibility...${NC}"
     curl -s https://dl.xanmod.org/check_X86-64_psabi.sh 2>/dev/null | bash 2>/dev/null
-    echo -e " ${YELLOW}Adding XanMod repo...${NC}"
-    curl -s https://dl.xanmod.org/archive.key 2>/dev/null | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
+    curl -s https://dl.xanmod.org/archive.key 2>/dev/null | \
+        gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
     echo -e " ${GREEN}✓ XanMod setup done. Reboot required.${NC}"
     menu_footer; sleep 2
 }
@@ -1230,7 +1932,6 @@ _s_xanmod_bbrv3() {
 _s_update_kernel() {
     menu_header "UPDATE KERNEL TO LATEST VERSION"
     echo -e " Current: ${YELLOW}$(uname -r)${NC}"
-    echo -e " ${YELLOW}Updating...${NC}"
     apt update -y 2>/dev/null | tail -1
     apt install -y --install-recommends linux-generic 2>/dev/null | tail -3
     echo -e " ${GREEN}✓ Done. Reboot to apply new kernel.${NC}"
@@ -1239,7 +1940,7 @@ _s_update_kernel() {
 
 _s_restart_all() {
     menu_header "RESTART ALL SERVICES"
-    svcs=(ssh dropbear stunnel4 openvpn squid nginx cron fail2ban xray xl2tpd)
+    svcs=(ssh dropbear stunnel4 openvpn squid nginx cron fail2ban xray xl2tpd badvpn ssh-ws rc-local vnstat)
     for s in "${svcs[@]}"; do
         systemctl restart $s 2>/dev/null \
             && printf "  ${GREEN}✓${NC} %-15s restarted\n" "$s" \
@@ -1256,12 +1957,8 @@ _s_reboot() {
 }
 
 _s_install_webmon() {
-    menu_header "INSTALL WEBMON"
-    echo -e " ${YELLOW}Installing Webmin...${NC}"
-    curl -o /tmp/setup-repos.sh https://raw.githubusercontent.com/webmin/webmin/master/setup-repos.sh 2>/dev/null
-    bash /tmp/setup-repos.sh --force 2>/dev/null
-    apt install -y webmin 2>/dev/null | tail -2
-    echo -e " ${GREEN}✓ Webmin installed — Port: 10000${NC}"
+    menu_header "INSTALL WEBMIN"
+    _install_webmin_full
     menu_footer; sleep 2
 }
 
@@ -1302,8 +1999,7 @@ _s_speedtest() {
     elif command -v speedtest &>/dev/null; then
         speedtest
     else
-        pip3 install speedtest-cli --break-system-packages -q 2>/dev/null \
-            || apt install -y speedtest-cli -q 2>/dev/null
+        _install_speedtest_full
         speedtest-cli --simple 2>/dev/null
     fi
     menu_footer; press_enter
@@ -1314,21 +2010,22 @@ _s_view_protocols() {
     echo ""
     printf "  ${CYAN}%-30s %s${NC}\n" "Protocol" "Port(s)"
     echo "  ──────────────────────────────────────────"
-    printf "  %-30s %s\n" "OpenSSH"           "22"
-    printf "  %-30s %s\n" "SSH Websocket"     "2052"
-    printf "  %-30s %s\n" "Dropbear"          "109, 143"
-    printf "  %-30s %s\n" "SSL/Stunnel"       "443"
-    printf "  %-30s %s\n" "OpenVPN TCP"       "1194"
-    printf "  %-30s %s\n" "OpenVPN UDP"       "2200"
-    printf "  %-30s %s\n" "OpenVPN SSL"       "442"
-    printf "  %-30s %s\n" "OpenVPN Websocket" "2095"
-    printf "  %-30s %s\n" "XRAY VLESS TLS"    "443"
-    printf "  %-30s %s\n" "XRAY VMESS WS"     "80"
-    printf "  %-30s %s\n" "XRAY VLESS WS"     "8880"
-    printf "  %-30s %s\n" "Squid Proxy"       "3128"
-    printf "  %-30s %s\n" "BadVPN UDP"        "7100, 7200, 7300"
-    printf "  %-30s %s\n" "Webmin"            "10000"
-    printf "  %-30s %s\n" "Nginx"             "81"
+    printf "  %-30s %s\n" "OpenSSH"            "22"
+    printf "  %-30s %s\n" "SSH Websocket"      "2052"
+    printf "  %-30s %s\n" "Dropbear"           "109, 143"
+    printf "  %-30s %s\n" "SSL/Stunnel"        "443, 444"
+    printf "  %-30s %s\n" "OpenVPN TCP"        "1194"
+    printf "  %-30s %s\n" "OpenVPN UDP"        "2200"
+    printf "  %-30s %s\n" "OpenVPN SSL"        "442"
+    printf "  %-30s %s\n" "OpenVPN Websocket"  "2095"
+    printf "  %-30s %s\n" "XRAY VLESS TLS"     "443"
+    printf "  %-30s %s\n" "XRAY VMESS WS"      "80"
+    printf "  %-30s %s\n" "XRAY VLESS WS"      "8880"
+    printf "  %-30s %s\n" "Squid Proxy"        "3128"
+    printf "  %-30s %s\n" "BadVPN UDP"         "7300"
+    printf "  %-30s %s\n" "L2TP / IPSec"       "500, 4500 UDP"
+    printf "  %-30s %s\n" "Webmin"             "10000"
+    printf "  %-30s %s\n" "Nginx"              "80, 81"
     echo ""
     menu_footer; press_enter
 }
@@ -1340,8 +2037,7 @@ _s_view_bandwidth() {
     else
         echo -e " ${YELLOW}Installing vnstat...${NC}"
         apt install -y vnstat 2>/dev/null
-        vnstat -u 2>/dev/null
-        vnstat 2>/dev/null
+        vnstat
     fi
     menu_footer; press_enter
 }
@@ -1361,7 +2057,7 @@ _s_check_ram() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████  ON/OFF SERVICES — مطابق للصورة
+# ██████  ON/OFF SERVICES
 # ══════════════════════════════════════════════════════════════
 services_toggle_menu() {
     while true; do
@@ -1371,18 +2067,14 @@ services_toggle_menu() {
         echo ""
 
         _st() {
-            local svc=$1
-            if systemctl is-active --quiet $svc 2>/dev/null; then
-                echo -e "${GREEN}ON${NC}"
-            else
-                echo -e "${RED}OFF${NC}"
-            fi
+            systemctl is-active --quiet $1 2>/dev/null \
+                && echo -e "${GREEN}ON${NC}" || echo -e "${RED}OFF${NC}"
         }
 
         printf " 1.  Service UDP Custom                (status: $(_st udp-custom))\n"
         printf " 2.  Service Capture Quota + Limit XRAY (status: $(_st xray))\n"
         printf " 3.  Service Limit XRAY Quota Only     (status: $(_st xray-quota))\n"
-        printf " 4.  Service SSH Websocket             (status: $(_st ssh))\n"
+        printf " 4.  Service SSH Websocket             (status: $(_st ssh-ws))\n"
         printf " 5.  Service STUNNEL-5                 (status: $(_st stunnel4))\n"
         printf " 6.  Service OpenVPN                   (status: $(_st openvpn))\n"
         printf " 7.  Service OpenVPN Websocket         (status: $(_st openvpn-ws))\n"
@@ -1391,10 +2083,13 @@ services_toggle_menu() {
         printf " 10. Service L2TP                      (status: $(_st xl2tpd))\n"
         printf " 11. Service RC Local                  (status: $(_st rc-local))\n"
         printf " 12. Service Xray                      (status: $(_st xray))\n"
+        printf " 13. Service BadVPN UDPGW              (status: $(_st badvpn))\n"
+        printf " 14. Service Nginx                     (status: $(_st nginx))\n"
+        printf " 15. Service Fail2Ban                  (status: $(_st fail2ban))\n"
         echo ""
         echo -e " ${RED}0.  Exit${NC}"
         echo -e "${BLUE}──────────────────────────────────────────${NC}"
-        read -p "Select a service to toggle (0 to exit): " opt
+        read -p "Select a service to toggle [0-15]: " opt
 
         _tog() {
             local svc=$1 name=$2
@@ -1414,7 +2109,7 @@ services_toggle_menu() {
             1)  _tog "udp-custom"     "UDP Custom" ;;
             2)  _tog "xray"           "Capture Quota + Limit XRAY" ;;
             3)  _tog "xray-quota"     "Limit XRAY Quota Only" ;;
-            4)  _tog "ssh"            "SSH Websocket" ;;
+            4)  _tog "ssh-ws"         "SSH Websocket" ;;
             5)  _tog "stunnel4"       "STUNNEL-5" ;;
             6)  _tog "openvpn"        "OpenVPN" ;;
             7)  _tog "openvpn-ws"     "OpenVPN Websocket" ;;
@@ -1423,6 +2118,9 @@ services_toggle_menu() {
             10) _tog "xl2tpd"         "L2TP" ;;
             11) _tog "rc-local"       "RC Local" ;;
             12) _tog "xray"           "Xray" ;;
+            13) _tog "badvpn"         "BadVPN UDPGW" ;;
+            14) _tog "nginx"          "Nginx" ;;
+            15) _tog "fail2ban"       "Fail2Ban" ;;
             0) break ;;
             *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
         esac
@@ -1430,7 +2128,7 @@ services_toggle_menu() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████  STATUS SERVICES — مطابق للصورة
+# ██████  STATUS SERVICES
 # ══════════════════════════════════════════════════════════════
 status_services() {
     clear
@@ -1442,26 +2140,28 @@ status_services() {
     _chk() {
         local svc=$1 label=$2
         if systemctl is-active --quiet $svc 2>/dev/null; then
-            printf "  ${CYAN}%-20s${NC}: ${GREEN}Running${NC}\n" "$label"
+            printf "  ${CYAN}%-22s${NC}: ${GREEN}Running ✓${NC}\n" "$label"
         else
-            printf "  ${CYAN}%-20s${NC}: ${RED}Not Running${NC}\n" "$label"
+            printf "  ${CYAN}%-22s${NC}: ${RED}Not Running ✗${NC}\n" "$label"
         fi
     }
 
     _chk ssh             "SSH"
-    _chk ssh             "SSH UDP"
-    _chk ssh             "SSH WEBSOCKET"
-    _chk openvpn         "OVPN"
-    _chk openvpn         "OVPN WEBSOCKET"
+    _chk ssh-ws          "SSH WEBSOCKET"
+    _chk openvpn         "OPENVPN"
     _chk dns-over-https  "SLOWDNS"
     _chk squid           "SQUID"
     _chk dropbear        "DROPBEAR"
-    _chk xray            "XRAY TLS"
-    _chk xray            "XRAY NTLS"
+    _chk stunnel4        "STUNNEL5"
+    _chk xray            "XRAY"
     _chk xl2tpd          "L2TP"
+    _chk badvpn          "BADVPN UDPGW"
     _chk nginx           "NGINX"
     _chk cron            "CRON"
     _chk fail2ban        "FAIL2BAN"
+    _chk rc-local        "RC-LOCAL"
+    _chk vnstat          "VNSTAT"
+    _chk warp-svc        "CLOUDFLARE WARP"
 
     echo ""
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
@@ -1469,7 +2169,7 @@ status_services() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████  UPDATE SCRIPT — مطابق للصورة
+# ██████  UPDATE SCRIPT
 # ══════════════════════════════════════════════════════════════
 update_script() {
     clear
@@ -1478,9 +2178,10 @@ update_script() {
     echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
     echo ""
     echo -e " Current version: ${YELLOW}$SCRIPT_VERSION${NC}"
-    LATEST=$(curl -s --connect-timeout 6 "https://raw.githubusercontent.com/alsaher2/script/main/version.txt" 2>/dev/null | tr -d '[:space:]')
+    LATEST=$(curl -s --connect-timeout 6 \
+        "https://raw.githubusercontent.com/alsaher2/script/main/version.txt" 2>/dev/null | tr -d '[:space:]')
     [ -z "$LATEST" ] && LATEST="1.3.0"
-    echo -e " Update version found: ${GREEN}$LATEST${NC}"
+    echo -e " Latest version : ${GREEN}$LATEST${NC}"
     echo ""
     read -p " Press Enter to update..."
     if [ "$LATEST" != "$SCRIPT_VERSION" ]; then
@@ -1496,7 +2197,7 @@ update_script() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████  STATUS SCRIPT — مطابق للصورة تماماً
+# ██████  STATUS SCRIPT
 # ══════════════════════════════════════════════════════════════
 status_script() {
     clear
@@ -1514,6 +2215,10 @@ status_script() {
 }
 
 # ══════════════════════════════════════════════════════════════
-# START
+# START — Check first run then launch menu
 # ══════════════════════════════════════════════════════════════
+if [ ! -f "$FIRST_RUN_FLAG" ]; then
+    first_run_install
+fi
+
 main_menu
