@@ -35,7 +35,223 @@ FIRST_RUN_FLAG="$INSTALL_DIR/config/.first_run_done"
 [[ $EUID -ne 0 ]] && { echo -e "${RED}Error: Run as root!${NC}"; exit 1; }
 
 # ─── Init Directories ──────────────────────────────────────────
-mkdir -p $INSTALL_DIR/{ssh,xray,l2tp,noobz,backup,config,logs}
+mkdir -p $INSTALL_DIR/{ssh,xray,l2tp,noobz,falcon,zivpn,backup,config,logs}
+
+# ══════════════════════════════════════════════════════════════
+# CLOUDFLARE DNS SETUP
+# ══════════════════════════════════════════════════════════════
+_cf_setup_domain() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "CLOUDFLARE DOMAIN SETUP"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}اربط دومينك بـ Cloudflare تلقائياً${NC}      ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ستحتاج إلى:                             ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}1.${NC} Domain مسجّل في Cloudflare            ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}2.${NC} API Token من Cloudflare               ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}     (Zone:DNS:Edit permission)           ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${LGREEN}[1]${NC} إعداد الدومين الآن                    ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${RED}[2]${NC} تخطى (يمكن الإعداد لاحقاً)             ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+    read -p " اختر [1/2]: " cf_choice
+
+    case $cf_choice in
+        1) _cf_do_setup ;;
+        2)
+            echo -e " ${YELLOW}⚠ تم التخطي — يمكن الإعداد لاحقاً من Settings > Change Domain${NC}"
+            sleep 2
+            ;;
+        *)
+            echo -e " ${YELLOW}تم التخطي.${NC}"
+            sleep 2
+            ;;
+    esac
+}
+
+_cf_do_setup() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "إدخال بيانات Cloudflare"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo ""
+
+    # ── Get server IP ──
+    IPADDR=$(curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null \
+          || curl -s  --connect-timeout 5 ipinfo.io/ip 2>/dev/null \
+          || hostname -I | awk '{print $1}')
+
+    echo -e " ${CYAN}IP السيرفر الحالي: ${YELLOW}$IPADDR${NC}"
+    echo ""
+
+    # ── Input: Root Domain ──
+    echo -e " ${WHITE}مثال: example.com${NC}"
+    read -p " أدخل الدومين الرئيسي (Root Domain): " CF_ZONE_NAME
+    [[ -z "$CF_ZONE_NAME" ]] && { echo -e "${RED}الدومين مطلوب!${NC}"; sleep 2; return; }
+
+    # ── Input: Subdomain ──
+    echo ""
+    echo -e " ${WHITE}مثال: vpn.example.com أو example.com${NC}"
+    read -p " أدخل السابدومين (اتركه فارغاً لاستخدام الرئيسي): " CF_SUBDOMAIN
+    [[ -z "$CF_SUBDOMAIN" ]] && CF_SUBDOMAIN="$CF_ZONE_NAME"
+
+    # ── Input: API Token ──
+    echo ""
+    echo -e " ${WHITE}احصل عليه من: dash.cloudflare.com > My Profile > API Tokens${NC}"
+    echo -e " ${WHITE}الصلاحيات المطلوبة: Zone > DNS > Edit${NC}"
+    read -p " أدخل Cloudflare API Token: " CF_API_TOKEN
+    [[ -z "$CF_API_TOKEN" ]] && { echo -e "${RED}API Token مطلوب!${NC}"; sleep 2; return; }
+
+    echo ""
+    echo -e " ${YELLOW}▶ جاري التحقق من البيانات...${NC}"
+
+    # ── Verify Token ──
+    CF_VERIFY=$(curl -s --connect-timeout 8 \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify")
+
+    if ! echo "$CF_VERIFY" | grep -q '"success":true'; then
+        echo -e " ${RED}✗ API Token غير صحيح أو منتهي الصلاحية!${NC}"
+        echo -e " ${YELLOW}تأكد من الصلاحيات: Zone:DNS:Edit${NC}"
+        sleep 3
+        return
+    fi
+    echo -e " ${GREEN}✓ API Token صحيح${NC}"
+
+    # ── Get Zone ID ──
+    echo -e " ${YELLOW}▶ جاري البحث عن Zone ID للدومين...${NC}"
+    CF_ZONE_RESP=$(curl -s --connect-timeout 8 \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones?name=${CF_ZONE_NAME}&status=active")
+
+    CF_ZONE_ID=$(echo "$CF_ZONE_RESP" | grep -oP '"id":"\K[^"]+' | head -1)
+
+    if [[ -z "$CF_ZONE_ID" ]]; then
+        echo -e " ${RED}✗ لم يُعثر على Zone للدومين: $CF_ZONE_NAME${NC}"
+        echo -e " ${YELLOW}تأكد أن الدومين مضاف في حساب Cloudflare وأن التوكن له صلاحية عليه${NC}"
+        sleep 4
+        return
+    fi
+    echo -e " ${GREEN}✓ Zone ID: ${CYAN}$CF_ZONE_ID${NC}"
+
+    # ── Extract record name (subdomain part only for CF) ──
+    # CF needs just the subdomain name relative to zone, or @ for root
+    if [[ "$CF_SUBDOMAIN" == "$CF_ZONE_NAME" ]]; then
+        CF_RECORD_NAME="@"
+        CF_DISPLAY_NAME="$CF_ZONE_NAME"
+    else
+        CF_RECORD_NAME="$CF_SUBDOMAIN"
+        CF_DISPLAY_NAME="$CF_SUBDOMAIN"
+    fi
+
+    # ── Check if record already exists ──
+    echo -e " ${YELLOW}▶ التحقق من السجلات الموجودة...${NC}"
+    CF_EXISTING=$(curl -s --connect-timeout 8 \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${CF_DISPLAY_NAME}")
+
+    CF_RECORD_ID=$(echo "$CF_EXISTING" | grep -oP '"id":"\K[^"]+' | head -1)
+
+    if [[ -n "$CF_RECORD_ID" ]]; then
+        # ── Update existing record ──
+        echo -e " ${YELLOW}▶ سجل موجود مسبقاً — جاري التحديث...${NC}"
+        CF_RESULT=$(curl -s --connect-timeout 8 -X PUT \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${IPADDR}\",\"ttl\":120,\"proxied\":false}" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}")
+        CF_ACTION="تحديث"
+    else
+        # ── Create new A record ──
+        echo -e " ${YELLOW}▶ إنشاء سجل DNS جديد...${NC}"
+        CF_RESULT=$(curl -s --connect-timeout 8 -X POST \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${IPADDR}\",\"ttl\":120,\"proxied\":false}" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records")
+        CF_ACTION="إنشاء"
+    fi
+
+    if echo "$CF_RESULT" | grep -q '"success":true'; then
+        echo ""
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e " ${GREEN}✓ تم $CF_ACTION السجل بنجاح!${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e " ${CYAN}الدومين   :${NC} ${YELLOW}$CF_DISPLAY_NAME${NC}"
+        echo -e " ${CYAN}IP السيرفر:${NC} ${YELLOW}$IPADDR${NC}"
+        echo -e " ${CYAN}النوع     :${NC} ${YELLOW}A Record (DNS Only)${NC}"
+        echo -e " ${CYAN}TTL       :${NC} ${YELLOW}120 ثانية${NC}"
+        echo -e " ${CYAN}Proxy     :${NC} ${YELLOW}OFF (DNS Only — مطلوب للـ VPN)${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e " ${YELLOW}ℹ قد يستغرق الـ DNS من 1-5 دقائق للانتشار${NC}"
+        echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+
+        # ── Save domain & CF credentials ──
+        echo "$CF_SUBDOMAIN"  > "$DOMAIN_FILE"
+        cat > "$INSTALL_DIR/config/cloudflare" <<EOF
+CF_API_TOKEN=$CF_API_TOKEN
+CF_ZONE_ID=$CF_ZONE_ID
+CF_ZONE_NAME=$CF_ZONE_NAME
+CF_SUBDOMAIN=$CF_SUBDOMAIN
+CF_RECORD_NAME=$CF_RECORD_NAME
+EOF
+        chmod 600 "$INSTALL_DIR/config/cloudflare"
+        echo -e " ${GREEN}✓ تم حفظ الدومين والبيانات${NC}"
+
+        # ── Ask: setup wildcard too? ──
+        echo ""
+        read -p " هل تريد إضافة Wildcard (*.${CF_ZONE_NAME}) أيضاً؟ [y/n]: " wc_choice
+        if [[ "$wc_choice" =~ ^[Yy]$ ]]; then
+            WC_RESULT=$(curl -s --connect-timeout 8 -X POST \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "{\"type\":\"A\",\"name\":\"*\",\"content\":\"${IPADDR}\",\"ttl\":120,\"proxied\":false}" \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records")
+            echo "$WC_RESULT" | grep -q '"success":true' \
+                && echo -e " ${GREEN}✓ تم إضافة Wildcard *.${CF_ZONE_NAME} → $IPADDR${NC}" \
+                || echo -e " ${YELLOW}⚠ الـ Wildcard موجود مسبقاً أو فشل الإنشاء${NC}"
+        fi
+
+    else
+        CF_ERROR=$(echo "$CF_RESULT" | grep -oP '"message":"\K[^"]+' | head -1)
+        echo ""
+        echo -e " ${RED}✗ فشل $CF_ACTION السجل!${NC}"
+        echo -e " ${RED}السبب: $CF_ERROR${NC}"
+        echo -e " ${YELLOW}يمكن الإعداد يدوياً لاحقاً من Settings > Change Domain${NC}"
+    fi
+
+    echo ""
+    press_enter
+}
+
+# ── Update CF record (callable from settings) ──
+_cf_update_record() {
+    if [ ! -f "$INSTALL_DIR/config/cloudflare" ]; then
+        echo -e " ${RED}لا توجد بيانات Cloudflare محفوظة. قم بالإعداد أولاً.${NC}"
+        sleep 2
+        return
+    fi
+    source "$INSTALL_DIR/config/cloudflare"
+    NEW_IP=$(curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    CF_EXISTING=$(curl -s --connect-timeout 8 \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${CF_SUBDOMAIN}")
+    CF_RECORD_ID=$(echo "$CF_EXISTING" | grep -oP '"id":"\K[^"]+' | head -1)
+    [ -z "$CF_RECORD_ID" ] && { echo -e "${RED}لم يُعثر على السجل!${NC}"; sleep 2; return; }
+    curl -s -X PUT \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${NEW_IP}\",\"ttl\":120,\"proxied\":false}" \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${CF_RECORD_ID}" > /dev/null
+    echo "$CF_SUBDOMAIN" > "$DOMAIN_FILE"
+    echo -e " ${GREEN}✓ DNS محدّث: ${YELLOW}$CF_SUBDOMAIN → $NEW_IP${NC}"
+}
 
 # ══════════════════════════════════════════════════════════════
 # FIRST RUN — AUTO INSTALL ALL SERVICES
@@ -45,30 +261,135 @@ first_run_install() {
     echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║${NC}  ${WHITE}ALSAHER VPN — FIRST TIME SETUP          ${BLUE}║${NC}"
     echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
-    echo -e "${BLUE}║${NC}  ${YELLOW}يبدو هذا أول تشغيل للسكريبت!${NC}           ${BLUE}║${NC}"
-    echo -e "${BLUE}║${NC}  هل تريد تنصيب جميع الخدمات الآن؟       ${BLUE}║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
-    echo -e "${BLUE}║${NC}  ${LGREEN}[1]${NC} نعم — نصّب كل الخدمات تلقائياً       ${BLUE}║${NC}"
-    echo -e "${BLUE}║${NC}  ${LGREEN}[2]${NC} لا — تخطى وانتقل للقائمة الرئيسية    ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}مرحباً! يبدو هذا أول تشغيل للسكريبت.${NC}   ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  سنقوم بإعداد السيرفر خطوة بخطوة.       ${BLUE}║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-    read -p "اختر [1/2]: " choice
+    sleep 2
 
-    case $choice in
-        1)
-            _do_full_install
-            ;;
-        2)
-            echo -e " ${YELLOW}تم التخطي. يمكنك التنصيب لاحقاً من قائمة [10]${NC}"
-            sleep 2
-            ;;
-        *)
-            echo -e "${RED}خيار غير صالح، تم التخطي.${NC}"
-            sleep 2
-            ;;
-    esac
+    # ── STEP 1: Cloudflare Domain ──────────────────────────────
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "الخطوة 1 / 2 — إعداد الدومين"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}قبل تنصيب الخدمات، هل لديك دومين       ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${CYAN}Cloudflare تريد ربطه بهذا السيرفر؟     ${BLUE}║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${LGREEN}[1]${NC} نعم — اربط الدومين الآن              ${BLUE}║${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}[2]${NC} لاحقاً — تخطى الآن                   ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+    read -p " اختر [1/2]: " cf_ans
+    [[ "$cf_ans" == "1" ]] && _cf_do_setup
+
+    # ── STEP 2: Check & Install Missing Services ──────────────
+    _check_and_install_missing
 
     # Mark first run as done
     touch "$FIRST_RUN_FLAG"
+}
+
+# ══════════════════════════════════════════════════════════════
+# CHECK MISSING SERVICES AND PROMPT INSTALL
+# ══════════════════════════════════════════════════════════════
+_check_and_install_missing() {
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "الخطوة 2 / 2 — فحص الخدمات"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║${NC}  ${YELLOW}جاري فحص الخدمات المثبّتة...${NC}           ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    sleep 1
+
+    # ── Define core required services ──
+    # Format: "display_name|check_cmd|install_fn"
+    local -a CORE_SVCS=(
+        "OpenSSH Server|ssh|_apt_install openssh-server ssh"
+        "Dropbear SSH|dropbear|_install_dropbear_full"
+        "Stunnel5 SSL|stunnel4|_install_stunnel_full"
+        "SSH Websocket|websocat|_install_websocat_full"
+        "OpenVPN|openvpn|_install_openvpn_full"
+        "Xray Core|xray|_install_xray_full"
+        "L2TP / IPSec|xl2tpd|_install_l2tp_full"
+        "Squid Proxy|squid|_apt_install squid squid"
+        "BadVPN UDPGW|badvpn-udpgw|_install_badvpn_full"
+        "Nginx|nginx|_apt_install nginx nginx"
+        "Certbot SSL|certbot|_install_certbot_full"
+        "Fail2Ban|fail2ban|_apt_install fail2ban fail2ban"
+        "UFW Firewall|ufw|_install_ufw_full"
+        "vnStat|vnstat|_apt_install vnstat vnstat"
+        "Cron|cron|_apt_install cron cron"
+        "RC-Local|rc-local|_install_rclocal_full"
+        "Net-Tools|net-tools|_apt_install net-tools ''"
+        "Python3|python3|_install_python_full"
+        "Iptables|iptables|_apt_install iptables ''"
+    )
+
+    # ── تحديث الحزم الأساسية أولاً بشكل صامت ──────────────────
+    echo "" >> "$LOG_FILE"
+    echo "=== AUTO-INSTALL MISSING — $(date) ===" >> "$LOG_FILE"
+    apt-get update -y >> "$LOG_FILE" 2>&1
+    apt-get install -y curl wget git unzip tar openssl gnupg2 lsb-release \
+        ca-certificates software-properties-common apt-transport-https \
+        >> "$LOG_FILE" 2>&1
+
+    local total=${#CORE_SVCS[@]}
+    local current=0
+    local success=0
+    local failed=0
+    local skipped=0
+
+    clear
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "الخطوة 2 / 2 — فحص وتنصيب الخدمات"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+
+    for entry in "${CORE_SVCS[@]}"; do
+        ((current++))
+        local name="${entry%%|*}"
+        local rest="${entry#*|}"
+        local check="${rest%%|*}"
+        local fn="${rest#*|}"
+
+        # ── عرض شريط التقدم ──
+        local pct=$(( current * 100 / total ))
+        local filled=$(( current * 20 / total ))
+        local bar=""
+        for ((b=0; b<filled; b++));  do bar+="█"; done
+        for ((b=filled; b<20; b++)); do bar+="░"; done
+
+        printf "\r${BLUE}║${NC}  [${GREEN}%s${NC}] %3d%%  %-20s   ${BLUE}║${NC}\n" \
+               "$bar" "$pct" "$name"
+
+        if _is_installed "$check"; then
+            printf "${BLUE}║${NC}   ${GREEN}✓${NC} %-37s${BLUE}║${NC}\n" "$name — مثبّت مسبقاً"
+            ((skipped++))
+            echo "[SKIP] $name already installed" >> "$LOG_FILE"
+        else
+            printf "${BLUE}║${NC}   ${YELLOW}▶${NC} %-37s${BLUE}║${NC}\n" "جاري تنصيب $name ..."
+            eval "$fn" >> "$LOG_FILE" 2>&1
+            if _is_installed "$check"; then
+                printf "${BLUE}║${NC}   ${GREEN}✓${NC} %-37s${BLUE}║${NC}\n" "$name — تم التنصيب"
+                ((success++))
+                echo "[OK] $name" >> "$LOG_FILE"
+            else
+                printf "${BLUE}║${NC}   ${RED}✗${NC} %-37s${BLUE}║${NC}\n" "$name — فشل التنصيب"
+                ((failed++))
+                echo "[FAIL] $name" >> "$LOG_FILE"
+            fi
+        fi
+    done
+
+    # ── ملخص نهائي ────────────────────────────────────────────
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    printf  "${BLUE}║${NC}  ${GREEN}✓ تم تنصيب  : %-3s خدمة%-20s${BLUE}║${NC}\n" "$success" ""
+    printf  "${BLUE}║${NC}  ${CYAN}● موجودة    : %-3s خدمة%-20s${BLUE}║${NC}\n" "$skipped" ""
+    [ $failed -gt 0 ] && \
+    printf  "${BLUE}║${NC}  ${RED}✗ فشل       : %-3s خدمة%-20s${BLUE}║${NC}\n" "$failed" ""
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    printf  "${BLUE}║${NC}  ${CYAN}السجل: ${YELLOW}%-33s${BLUE}║${NC}\n" "$LOG_FILE"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+    press_enter
 }
 
 _do_full_install() {
@@ -317,10 +638,12 @@ get_system_info() {
 }
 
 count_accounts() {
-    SSH_COUNT=$(ls  $INSTALL_DIR/ssh/  2>/dev/null | wc -l)
-    XRAY_COUNT=$(ls $INSTALL_DIR/xray/ 2>/dev/null | wc -l)
-    L2TP_COUNT=$(ls $INSTALL_DIR/l2tp/ 2>/dev/null | wc -l)
-    NOOBZ_COUNT=$(ls $INSTALL_DIR/noobz/ 2>/dev/null | wc -l)
+    SSH_COUNT=$(ls    $INSTALL_DIR/ssh/    2>/dev/null | wc -l)
+    XRAY_COUNT=$(ls   $INSTALL_DIR/xray/   2>/dev/null | wc -l)
+    L2TP_COUNT=$(ls   $INSTALL_DIR/l2tp/   2>/dev/null | wc -l)
+    NOOBZ_COUNT=$(ls  $INSTALL_DIR/noobz/  2>/dev/null | wc -l)
+    FALCON_COUNT=$(ls $INSTALL_DIR/falcon/ 2>/dev/null | wc -l)
+    ZIVPN_COUNT=$(ls $INSTALL_DIR/zivpn/  2>/dev/null | wc -l)
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -357,6 +680,10 @@ show_header() {
     printf "${BLUE}║${NC}      L2TP ACCOUNT =${GREEN}  %-3s                  ${BLUE}║${NC}\n" "$L2TP_COUNT"
     echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
     printf "${BLUE}║${NC}     NOOBZ ACCOUNT =${GREEN}  %-3s                  ${BLUE}║${NC}\n" "$NOOBZ_COUNT"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    printf "${BLUE}║${NC}    FALCON ACCOUNT =${GREEN}  %-3s                  ${BLUE}║${NC}\n" "$FALCON_COUNT"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    printf "${BLUE}║${NC}    ZIVPN ACCOUNT  =${GREEN}  %-3s                  ${BLUE}║${NC}\n" "$ZIVPN_COUNT"
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
 }
 
@@ -374,29 +701,33 @@ main_menu() {
         echo -e "${BLUE}║${NC} ${LGREEN}2.${NC}  MENU XRAY                            ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${LGREEN}3.${NC}  MENU L2TP                            ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${LGREEN}4.${NC}  MENU NOOBZVPNS                       ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC}  SETTINGS                             ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC}  ON/OFF SERVICES                      ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC}  STATUS SERVICES                      ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC}  UPDATE SCRIPT                        ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC}  STATUS SCRIPT                        ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC} ${LGREEN}10.${NC} INSTALL / REMOVE SERVICES            ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC}  MENU FALCON PROXY                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC}  MENU ZIVPN                           ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC}  SETTINGS                             ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC}  ON/OFF SERVICES                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC}  STATUS SERVICES                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}10.${NC} UPDATE SCRIPT                        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}11.${NC} STATUS SCRIPT                        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}12.${NC} INSTALL / REMOVE SERVICES            ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${RED}0.${NC}  Exit                                 ${BLUE}║${NC}"
         echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
         echo -e "${BLUE}║${NC} EXP SCRIPT: ${YELLOW}$EXP_DATE ($EXP_DAYS days)${NC}  ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} REGIST BY : ${YELLOW}$REGIST_BY (id telegram)${NC}  ${BLUE}║${NC}"
         echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-        read -p "Please select an option [0-10]: " opt
+        read -p "Please select an option [0-12]: " opt
         case $opt in
             1)  ssh_menu ;;
             2)  xray_menu ;;
             3)  l2tp_menu ;;
             4)  noobz_menu ;;
-            5)  settings_menu ;;
-            6)  services_toggle_menu ;;
-            7)  status_services ;;
-            8)  update_script ;;
-            9)  status_script ;;
-            10) install_menu ;;
+            5)  falcon_menu ;;
+            6)  zivpn_menu ;;
+            7)  settings_menu ;;
+            8)  services_toggle_menu ;;
+            9)  status_services ;;
+            10) update_script ;;
+            11) status_script ;;
+            12) install_menu ;;
             0)  echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
             *)  echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
         esac
@@ -463,6 +794,8 @@ install_menu() {
         printf  "${BLUE}║${NC}  ${LGREEN}[6]${NC}  Xray Core               $(_badge xray)   ${BLUE}║${NC}\n"
         printf  "${BLUE}║${NC}  ${LGREEN}[7]${NC}  L2TP / IPSec (xl2tpd)  $(_badge xl2tpd)   ${BLUE}║${NC}\n"
         printf  "${BLUE}║${NC}  ${LGREEN}[8]${NC}  WireGuard               $(_badge wg)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[26]${NC} Falcon Proxy            $(_badge proxy)   ${BLUE}║${NC}\n"
+        printf  "${BLUE}║${NC}  ${LGREEN}[27]${NC} ZiVPN (UDP 5667)        $(_badge zivpn)   ${BLUE}║${NC}\n"
         echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
         printf  "${BLUE}║${NC} ${PURPLE}► PROXY & DNS${NC}%-28s${BLUE}║${NC}\n" ""
         printf  "${BLUE}║${NC}  ${LGREEN}[9]${NC}  Squid Proxy             $(_badge squid)   ${BLUE}║${NC}\n"
@@ -517,6 +850,8 @@ install_menu() {
             23) _svc_menu "RC-Local"             "rc-local"        "rc-local"      "_install_rclocal_full" ;;
             24) _svc_menu "Cron"                 "cron"            "cron"          "_apt_install" ;;
             25) _svc_menu "TC Traffic Control"   "iproute2"        ""              "_apt_install" ;;
+            26) _svc_menu "Falcon Proxy"            "proxy"           "falcon-proxy"  "_install_falcon_full" ;;
+            27) _svc_menu "ZiVPN UDP"               "zivpn"           "zivpn"         "_install_zivpn_full" ;;
             0) break ;;
             *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
         esac
@@ -1603,7 +1938,779 @@ _noobz_reset_quota() {
     menu_footer; press_enter
 }
 
+
 # ══════════════════════════════════════════════════════════════
+# ██████  FALCON PROXY
+# ══════════════════════════════════════════════════════════════
+falcon_menu() {
+    while true; do
+        clear
+        FALCON_BIN_VER=$(proxy --version 2>/dev/null | head -1 || echo "Not installed")
+        echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+        printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "MENU FALCON PROXY"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC} Version: ${CYAN}$FALCON_BIN_VER${NC}                       ${BLUE}║${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}1.${NC}  Create Falcon User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}2.${NC}  Trial Falcon User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC}  Renew Falcon User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}4.${NC}  Delete Falcon User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC}  List All Falcon Users                ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC}  Detail Falcon User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC}  Block Falcon User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC}  Unblock Falcon User                  ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC}  Reset Falcon Quota                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}10.${NC} Change Limit IP                      ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}11.${NC} Change Quota                         ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}12.${NC} Users Expiring Within 3 Days         ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${RED}0.${NC}  Back to Main Menu                   ${BLUE}║${NC}"
+        echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+        read -p "Please select an option [0-12]: " opt
+        case $opt in
+            1)  _falcon_create ;;
+            2)  _falcon_trial ;;
+            3)  _falcon_renew ;;
+            4)  _falcon_delete ;;
+            5)  _falcon_list ;;
+            6)  _falcon_detail ;;
+            7)  _falcon_block ;;
+            8)  _falcon_unblock ;;
+            9)  _falcon_reset_quota ;;
+            10) _falcon_limit_ip ;;
+            11) _falcon_limit_quota ;;
+            12) _falcon_expiring ;;
+            0) break ;;
+            *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+_falcon_create() {
+    menu_header "CREATE FALCON PROXY USER"
+    read -p " Username        : " user
+    [[ -z "$user" ]] && { echo -e "${RED}Username required!${NC}"; sleep 2; return; }
+    [ -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User already exists!${NC}"; sleep 2; return; }
+    read -p " Password        : " pass
+    read -p " Duration (days) : " days
+    read -p " Max IP (def 2)  : " maxip
+    read -p " Quota GB (def 50): " quota
+    [[ -z "$pass"  ]] && { echo -e "${RED}Password required!${NC}"; sleep 2; return; }
+    [[ -z "$days"  ]] && days=30
+    [[ -z "$maxip" ]] && maxip=2
+    [[ -z "$quota" ]] && quota=50
+    exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    domain=$(cat $DOMAIN_FILE 2>/dev/null || echo "$IPADDR")
+    cat > $INSTALL_DIR/falcon/$user <<EOF
+Username : $user
+Password : $pass
+Domain   : $domain
+Created  : $(date +"%Y-%m-%d")
+Expires  : $exp
+Duration : $days days
+Max IP   : $maxip
+Quota    : $quota GB
+Used     : 0 GB
+Status   : Active
+EOF
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e " ${GREEN}✓ Falcon user created!${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e " Username : ${YELLOW}$user${NC}"
+    echo -e " Password : ${YELLOW}$pass${NC}"
+    echo -e " Host     : ${YELLOW}$domain${NC}"
+    echo -e " Port     : ${YELLOW}8080${NC}"
+    echo -e " Expires  : ${YELLOW}$exp${NC}"
+    echo -e " Max IP   : ${YELLOW}$maxip${NC}"
+    echo -e " Quota    : ${YELLOW}$quota GB${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_trial() {
+    menu_header "TRIAL FALCON PROXY USER"
+    user="falcon$(date +%s | tail -c 5)"
+    pass="trial123"
+    exp=$(date -d "+1 day" +"%Y-%m-%d")
+    domain=$(cat $DOMAIN_FILE 2>/dev/null || echo "$IPADDR")
+    cat > $INSTALL_DIR/falcon/$user <<EOF
+Username : $user
+Password : $pass
+Domain   : $domain
+Created  : $(date +"%Y-%m-%d")
+Expires  : $exp
+Duration : 1 day (Trial)
+Max IP   : 1
+Quota    : 5 GB
+Used     : 0 GB
+Status   : Active
+EOF
+    echo -e " ${GREEN}✓ Trial Falcon created!${NC}"
+    echo -e " Username : ${YELLOW}$user${NC}"
+    echo -e " Password : ${YELLOW}$pass${NC}"
+    echo -e " Host     : ${YELLOW}$domain${NC}"
+    echo -e " Port     : ${YELLOW}8080${NC}"
+    echo -e " Expires  : ${YELLOW}$exp${NC} (1 day)"
+    # Register in 3proxy
+    _falcon_add_3proxy_user "$user" "$pass" 2>/dev/null
+    menu_footer; press_enter
+}
+
+_falcon_renew() {
+    menu_header "RENEW FALCON USER"
+    if [ "$(ls $INSTALL_DIR/falcon/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        echo -e " ${CYAN}Current Accounts:${NC}"
+        for u in $(ls $INSTALL_DIR/falcon/); do
+            exp=$(grep "Expires" $INSTALL_DIR/falcon/$u | cut -d':' -f2 | xargs)
+            echo -e "  ${YELLOW}$u${NC} — $exp"
+        done; echo ""
+    fi
+    read -p " Username to renew: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    read -p " Add days        : " days
+    cur_exp=$(grep "Expires" $INSTALL_DIR/falcon/$user | cut -d':' -f2 | xargs)
+    new_exp=$(date -d "$cur_exp +${days} days" +"%Y-%m-%d" 2>/dev/null || date -d "+${days} days" +"%Y-%m-%d")
+    sed -i "s/Expires.*/Expires  : $new_exp/" $INSTALL_DIR/falcon/$user
+    echo -e " ${GREEN}✓ Renewed until $new_exp${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_delete() {
+    menu_header "DELETE FALCON USER"
+    if [ "$(ls $INSTALL_DIR/falcon/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        echo -e " ${CYAN}Accounts:${NC}"
+        for u in $(ls $INSTALL_DIR/falcon/); do
+            exp=$(grep "Expires" $INSTALL_DIR/falcon/$u | cut -d':' -f2 | xargs)
+            echo -e "  ${YELLOW}$u${NC} — $exp"
+        done; echo ""
+    fi
+    read -p " Username to delete: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    confirm_action " Delete $user?" || { echo "Cancelled."; sleep 1; return; }
+    rm -f $INSTALL_DIR/falcon/$user
+    _falcon_del_3proxy_user "$user" 2>/dev/null
+    echo -e " ${GREEN}✓ Falcon user '$user' deleted!${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_list() {
+    menu_header "LIST ALL FALCON USERS"
+    echo ""
+    printf "  %-5s %-18s %-12s %-6s %-10s %-8s %s\n" "No" "Username" "Expires" "MaxIP" "Quota" "Used" "Status"
+    echo "  ──────────────────────────────────────────────────────────"
+    if [ -d "$INSTALL_DIR/falcon" ] && [ "$(ls -A $INSTALL_DIR/falcon 2>/dev/null)" ]; then
+        i=1
+        today_ts=$(date +%s)
+        for u in $(ls $INSTALL_DIR/falcon/); do
+            exp=$(grep    "Expires"  $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs)
+            maxip=$(grep  "Max IP"   $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "2")
+            quota=$(grep  "^Quota"   $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "50 GB")
+            used=$(grep   "^Used"    $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "0 GB")
+            status=$(grep "Status"   $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "Active")
+            exp_ts=$(date -d "$exp" +%s 2>/dev/null || echo 0)
+            if [ $exp_ts -lt $today_ts ]; then sc="${RED}Expired${NC}"
+            elif [[ "$status" == "Blocked" ]]; then sc="${YELLOW}Blocked${NC}"
+            else sc="${GREEN}Active${NC}"; fi
+            printf "  %-5s %-18s %-12s %-6s %-10s %-8s " "$i." "$u" "$exp" "$maxip" "$quota" "$used"
+            echo -e "$sc"
+            ((i++))
+        done
+    else
+        echo -e "  ${YELLOW}No Falcon accounts found${NC}"
+    fi
+    echo ""
+    menu_footer; press_enter
+}
+
+_falcon_detail() {
+    menu_header "DETAIL FALCON USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    echo ""
+    while IFS= read -r line; do echo -e "  ${CYAN}$line${NC}"; done < $INSTALL_DIR/falcon/$user
+    echo ""
+    domain=$(grep "Domain"   $INSTALL_DIR/falcon/$user | cut -d':' -f2 | xargs)
+    pass=$(grep   "Password" $INSTALL_DIR/falcon/$user | cut -d':' -f2 | xargs)
+    echo -e " ${YELLOW}── Connection Info ──${NC}"
+    echo -e " Host : ${YELLOW}$domain${NC}"
+    echo -e " Port : ${YELLOW}8080${NC}"
+    echo -e " User : ${YELLOW}$user${NC}"
+    echo -e " Pass : ${YELLOW}$pass${NC}"
+    echo -e " Type : ${YELLOW}HTTP/HTTPS Proxy${NC}"
+    echo ""
+    menu_footer; press_enter
+}
+
+_falcon_block() {
+    menu_header "BLOCK FALCON USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/Status.*/Status   : Blocked/" $INSTALL_DIR/falcon/$user
+    _falcon_block_3proxy_user "$user" 2>/dev/null
+    echo -e " ${GREEN}✓ User '$user' blocked!${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_unblock() {
+    menu_header "UNBLOCK FALCON USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/Status.*/Status   : Active/" $INSTALL_DIR/falcon/$user
+    _falcon_unblock_3proxy_user "$user" 2>/dev/null
+    echo -e " ${GREEN}✓ User '$user' unblocked!${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_reset_quota() {
+    menu_header "RESET FALCON QUOTA"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/^Used.*/Used     : 0 GB/" $INSTALL_DIR/falcon/$user
+    echo -e " ${GREEN}✓ Quota reset for '$user'${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_limit_ip() {
+    menu_header "CHANGE LIMIT IP — FALCON"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    cur=$(grep "Max IP" $INSTALL_DIR/falcon/$user | cut -d':' -f2 | xargs)
+    echo -e " Current Max IP: ${YELLOW}$cur${NC}"
+    read -p " New Max IP limit (1-10): " maxip
+    [[ ! "$maxip" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid!${NC}"; sleep 2; return; }
+    sed -i "s/Max IP.*/Max IP   : $maxip/" $INSTALL_DIR/falcon/$user
+    echo -e " ${GREEN}✓ Max IP updated to $maxip for $user${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_limit_quota() {
+    menu_header "CHANGE QUOTA — FALCON"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/falcon/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    cur=$(grep "^Quota" $INSTALL_DIR/falcon/$user | cut -d':' -f2 | xargs)
+    echo -e " Current Quota: ${YELLOW}$cur${NC}"
+    read -p " New Quota (GB): " quota
+    [[ ! "$quota" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid!${NC}"; sleep 2; return; }
+    sed -i "s/^Quota.*/Quota    : $quota GB/" $INSTALL_DIR/falcon/$user
+    echo -e " ${GREEN}✓ Quota updated to $quota GB for $user${NC}"
+    menu_footer; press_enter
+}
+
+_falcon_expiring() {
+    menu_header "FALCON USERS EXPIRING WITHIN 3 DAYS"
+    echo ""
+    today=$(date +%s)
+    limit=$((today + 259200))
+    found=0
+    for u in $(ls $INSTALL_DIR/falcon/ 2>/dev/null); do
+        exp_str=$(grep "Expires" $INSTALL_DIR/falcon/$u 2>/dev/null | cut -d':' -f2 | xargs)
+        [ -z "$exp_str" ] && continue
+        exp_ts=$(date -d "$exp_str" +%s 2>/dev/null) || continue
+        if [ $exp_ts -le $limit ] && [ $exp_ts -ge $today ]; then
+            days_left=$(( (exp_ts - today) / 86400 ))
+            echo -e "  ${WHITE}$u${NC} — Expires: ${RED}$exp_str${NC} (${days_left} days left)"
+            found=1
+        fi
+    done
+    [ $found -eq 0 ] && echo -e "  ${GREEN}No Falcon users expiring within 3 days ✓${NC}"
+    echo ""
+    menu_footer; press_enter
+}
+
+_install_falcon_full() {
+    _log_step "تنصيب Falcon Proxy (3proxy HTTP+SOCKS5)..."
+    apt-get install -y build-essential git curl wget >> "$LOG_FILE" 2>&1
+
+    # ── Build 3proxy from source ──────────────────────────────
+    if ! command -v 3proxy &>/dev/null; then
+        cd /tmp
+        rm -rf 3proxy
+        git clone https://github.com/3proxy/3proxy.git >> "$LOG_FILE" 2>&1
+        cd 3proxy
+        make -f Makefile.Linux >> "$LOG_FILE" 2>&1
+        cp bin/3proxy /usr/local/bin/3proxy
+        chmod +x /usr/local/bin/3proxy
+        cd /root
+    fi
+
+    # ── Create config directories ──────────────────────────────
+    mkdir -p /etc/3proxy /var/log/3proxy
+    touch /etc/3proxy/passwd
+
+    # ── Write default 3proxy config ───────────────────────────
+    cat > /etc/3proxy/3proxy.cfg <<'EOF3'
+#!/usr/local/bin/3proxy
+# Falcon Proxy — powered by 3proxy
+daemon
+pidfile /var/run/3proxy.pid
+nserver 8.8.8.8
+nserver 8.8.4.4
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
+log /var/log/3proxy/access.log D
+logformat "- +_L%t.%.  %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+rotate 30
+# Auth file
+users $/etc/3proxy/passwd
+# Allow authenticated users only
+auth strong
+allow *
+# HTTP Proxy port 8080
+proxy -p8080 -a
+# SOCKS5 port 1080
+socks -p1080 -a
+EOF3
+
+    # ── Systemd service ────────────────────────────────────────
+    cat > /etc/systemd/system/falcon-proxy.service <<'FEOF'
+[Unit]
+Description=Falcon Proxy (3proxy HTTP+SOCKS5)
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+PIDFile=/var/run/3proxy.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+FEOF
+
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1
+    systemctl enable falcon-proxy >> "$LOG_FILE" 2>&1
+    systemctl start  falcon-proxy >> "$LOG_FILE" 2>&1
+    _log_ok "Falcon Proxy — HTTP:8080 | SOCKS5:1080"
+}
+
+# ── Add user to 3proxy passwd file ────────────────────────────
+_falcon_add_3proxy_user() {
+    local user="$1" pass="$2"
+    # 3proxy uses CL (clear text) or CR (crypt) passwords
+    # Format: username:CL:password
+    if grep -q "^${user}:" /etc/3proxy/passwd 2>/dev/null; then
+        sed -i "s|^${user}:.*|${user}:CL:${pass}|" /etc/3proxy/passwd
+    else
+        echo "${user}:CL:${pass}" >> /etc/3proxy/passwd
+    fi
+    systemctl reload falcon-proxy 2>/dev/null || systemctl restart falcon-proxy 2>/dev/null
+}
+
+# ── Remove user from 3proxy passwd file ───────────────────────
+_falcon_del_3proxy_user() {
+    local user="$1"
+    sed -i "/^${user}:/d" /etc/3proxy/passwd 2>/dev/null
+    systemctl reload falcon-proxy 2>/dev/null || systemctl restart falcon-proxy 2>/dev/null
+}
+
+# ── Block/unblock user in 3proxy (comment out line) ───────────
+_falcon_block_3proxy_user() {
+    local user="$1"
+    sed -i "s|^${user}:|#BLOCKED#${user}:|" /etc/3proxy/passwd 2>/dev/null
+    systemctl reload falcon-proxy 2>/dev/null || systemctl restart falcon-proxy 2>/dev/null
+}
+
+_falcon_unblock_3proxy_user() {
+    local user="$1"
+    sed -i "s|^#BLOCKED#${user}:|${user}:|" /etc/3proxy/passwd 2>/dev/null
+    systemctl reload falcon-proxy 2>/dev/null || systemctl restart falcon-proxy 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# ██████  ZIVPN (UDP 5667)
+# ══════════════════════════════════════════════════════════════
+zivpn_menu() {
+    while true; do
+        clear
+        ZI_VER=$(zivpn --version 2>/dev/null | head -1 || echo "Not installed")
+        echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+        printf  "${BLUE}║${NC}  ${WHITE}%-40s${NC}${BLUE}║${NC}\n" "MENU ZIVPN (UDP 5667)"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC} Version: ${CYAN}$ZI_VER${NC}                         ${BLUE}║${NC}"
+        echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}1.${NC}  Create ZiVPN User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}2.${NC}  Trial ZiVPN User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}3.${NC}  Renew ZiVPN User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}4.${NC}  Delete ZiVPN User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}5.${NC}  List All ZiVPN Users                ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}6.${NC}  Detail ZiVPN User                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}7.${NC}  Block ZiVPN User                    ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}8.${NC}  Unblock ZiVPN User                  ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}9.${NC}  Reset ZiVPN Quota                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}10.${NC} Change Limit IP                     ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}11.${NC} Change Quota                        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}12.${NC} Change ZiVPN Port                   ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${LGREEN}13.${NC} Users Expiring Within 3 Days        ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC} ${RED}0.${NC}  Back to Main Menu                   ${BLUE}║${NC}"
+        echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+        read -p "Please select an option [0-13]: " opt
+        case $opt in
+            1)  _zivpn_create ;;
+            2)  _zivpn_trial ;;
+            3)  _zivpn_renew ;;
+            4)  _zivpn_delete ;;
+            5)  _zivpn_list ;;
+            6)  _zivpn_detail ;;
+            7)  _zivpn_block ;;
+            8)  _zivpn_unblock ;;
+            9)  _zivpn_reset_quota ;;
+            10) _zivpn_limit_ip ;;
+            11) _zivpn_limit_quota ;;
+            12) _zivpn_change_port ;;
+            13) _zivpn_expiring ;;
+            0) break ;;
+            *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+_zivpn_create() {
+    menu_header "CREATE ZIVPN USER"
+    read -p " Username        : " user
+    [[ -z "$user" ]] && { echo -e "${RED}Username required!${NC}"; sleep 2; return; }
+    [ -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User already exists!${NC}"; sleep 2; return; }
+    read -p " Password        : " pass
+    read -p " Duration (days) : " days
+    read -p " Max IP (def 2)  : " maxip
+    read -p " Quota GB (def 50): " quota
+    [[ -z "$pass"  ]] && { echo -e "${RED}Password required!${NC}"; sleep 2; return; }
+    [[ -z "$days"  ]] && days=30
+    [[ -z "$maxip" ]] && maxip=2
+    [[ -z "$quota" ]] && quota=50
+    exp=$(date -d "+${days} days" +"%Y-%m-%d")
+    domain=$(cat $DOMAIN_FILE 2>/dev/null || echo "$IPADDR")
+    port=$(cat $INSTALL_DIR/config/zivpn_port 2>/dev/null || echo "5667")
+    cat > $INSTALL_DIR/zivpn/$user <<EOF
+Username : $user
+Password : $pass
+Domain   : $domain
+Created  : $(date +"%Y-%m-%d")
+Expires  : $exp
+Duration : $days days
+Max IP   : $maxip
+Quota    : $quota GB
+Used     : 0 GB
+Status   : Active
+EOF
+    # Register in ZiVPN system
+    _zivpn_add_user "$user" "$pass"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e " ${GREEN}✓ ZiVPN user created!${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${NC}"
+    echo -e " Username : ${YELLOW}$user${NC}"
+    echo -e " Password : ${YELLOW}$pass${NC}"
+    echo -e " Host     : ${YELLOW}$domain${NC}"
+    echo -e " Port     : ${YELLOW}$port (UDP)${NC}"
+    echo -e " Expires  : ${YELLOW}$exp${NC}"
+    echo -e " Max IP   : ${YELLOW}$maxip${NC}"
+    echo -e " Quota    : ${YELLOW}$quota GB${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_trial() {
+    menu_header "TRIAL ZIVPN USER"
+    user="zi$(date +%s | tail -c 5)"
+    pass="trial123"
+    exp=$(date -d "+1 day" +"%Y-%m-%d")
+    domain=$(cat $DOMAIN_FILE 2>/dev/null || echo "$IPADDR")
+    port=$(cat $INSTALL_DIR/config/zivpn_port 2>/dev/null || echo "5667")
+    cat > $INSTALL_DIR/zivpn/$user <<EOF
+Username : $user
+Password : $pass
+Domain   : $domain
+Created  : $(date +"%Y-%m-%d")
+Expires  : $exp
+Duration : 1 day (Trial)
+Max IP   : 1
+Quota    : 5 GB
+Used     : 0 GB
+Status   : Active
+EOF
+    _zivpn_add_user "$user" "$pass"
+    echo -e " ${GREEN}✓ Trial ZiVPN created!${NC}"
+    echo -e " Username : ${YELLOW}$user${NC}"
+    echo -e " Password : ${YELLOW}$pass${NC}"
+    echo -e " Host     : ${YELLOW}$domain${NC}"
+    echo -e " Port     : ${YELLOW}$port (UDP)${NC}"
+    echo -e " Expires  : ${YELLOW}$exp${NC} (1 day)"
+    menu_footer; press_enter
+}
+
+_zivpn_renew() {
+    menu_header "RENEW ZIVPN USER"
+    if [ "$(ls $INSTALL_DIR/zivpn/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        echo -e " ${CYAN}Current Accounts:${NC}"
+        for u in $(ls $INSTALL_DIR/zivpn/); do
+            exp=$(grep "Expires" $INSTALL_DIR/zivpn/$u | cut -d':' -f2 | xargs)
+            echo -e "  ${YELLOW}$u${NC} — $exp"
+        done; echo ""
+    fi
+    read -p " Username to renew: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    read -p " Add days        : " days
+    cur_exp=$(grep "Expires" $INSTALL_DIR/zivpn/$user | cut -d':' -f2 | xargs)
+    new_exp=$(date -d "$cur_exp +${days} days" +"%Y-%m-%d" 2>/dev/null || date -d "+${days} days" +"%Y-%m-%d")
+    sed -i "s/Expires.*/Expires  : $new_exp/" $INSTALL_DIR/zivpn/$user
+    echo -e " ${GREEN}✓ Renewed until $new_exp${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_delete() {
+    menu_header "DELETE ZIVPN USER"
+    if [ "$(ls $INSTALL_DIR/zivpn/ 2>/dev/null | wc -l)" -gt 0 ]; then
+        echo -e " ${CYAN}Accounts:${NC}"
+        for u in $(ls $INSTALL_DIR/zivpn/); do
+            exp=$(grep "Expires" $INSTALL_DIR/zivpn/$u | cut -d':' -f2 | xargs)
+            echo -e "  ${YELLOW}$u${NC} — $exp"
+        done; echo ""
+    fi
+    read -p " Username to delete: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    confirm_action " Delete $user?" || { echo "Cancelled."; sleep 1; return; }
+    rm -f $INSTALL_DIR/zivpn/$user
+    _zivpn_del_user "$user"
+    echo -e " ${GREEN}✓ ZiVPN user '$user' deleted!${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_list() {
+    menu_header "LIST ALL ZIVPN USERS"
+    echo ""
+    printf "  %-5s %-18s %-12s %-6s %-10s %-8s %s\n" "No" "Username" "Expires" "MaxIP" "Quota" "Used" "Status"
+    echo "  ──────────────────────────────────────────────────────────"
+    if [ -d "$INSTALL_DIR/zivpn" ] && [ "$(ls -A $INSTALL_DIR/zivpn 2>/dev/null)" ]; then
+        i=1
+        today_ts=$(date +%s)
+        for u in $(ls $INSTALL_DIR/zivpn/); do
+            exp=$(grep    "Expires"  $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs)
+            maxip=$(grep  "Max IP"   $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "2")
+            quota=$(grep  "^Quota"   $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "50 GB")
+            used=$(grep   "^Used"    $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "0 GB")
+            status=$(grep "Status"   $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs || echo "Active")
+            exp_ts=$(date -d "$exp" +%s 2>/dev/null || echo 0)
+            if   [ $exp_ts -lt $today_ts ];        then sc="${RED}Expired${NC}"
+            elif [[ "$status" == "Blocked" ]];      then sc="${YELLOW}Blocked${NC}"
+            else sc="${GREEN}Active${NC}"; fi
+            printf "  %-5s %-18s %-12s %-6s %-10s %-8s " "$i." "$u" "$exp" "$maxip" "$quota" "$used"
+            echo -e "$sc"
+            ((i++))
+        done
+    else
+        echo -e "  ${YELLOW}No ZiVPN accounts found${NC}"
+    fi
+    echo ""
+    menu_footer; press_enter
+}
+
+_zivpn_detail() {
+    menu_header "DETAIL ZIVPN USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    echo ""
+    while IFS= read -r line; do echo -e "  ${CYAN}$line${NC}"; done < $INSTALL_DIR/zivpn/$user
+    echo ""
+    domain=$(grep "Domain"   $INSTALL_DIR/zivpn/$user | cut -d':' -f2 | xargs)
+    pass=$(grep   "Password" $INSTALL_DIR/zivpn/$user | cut -d':' -f2 | xargs)
+    port=$(cat $INSTALL_DIR/config/zivpn_port 2>/dev/null || echo "5667")
+    echo -e " ${YELLOW}── Connection Info ──${NC}"
+    echo -e " Host     : ${YELLOW}$domain${NC}"
+    echo -e " Port     : ${YELLOW}$port (UDP)${NC}"
+    echo -e " Username : ${YELLOW}$user${NC}"
+    echo -e " Password : ${YELLOW}$pass${NC}"
+    echo -e " Protocol : ${YELLOW}UDP / ZiVPN${NC}"
+    echo ""
+    menu_footer; press_enter
+}
+
+_zivpn_block() {
+    menu_header "BLOCK ZIVPN USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/Status.*/Status   : Blocked/" $INSTALL_DIR/zivpn/$user
+    _zivpn_block_user "$user"
+    echo -e " ${GREEN}✓ User '$user' blocked!${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_unblock() {
+    menu_header "UNBLOCK ZIVPN USER"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/Status.*/Status   : Active/" $INSTALL_DIR/zivpn/$user
+    _zivpn_unblock_user "$user"
+    echo -e " ${GREEN}✓ User '$user' unblocked!${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_reset_quota() {
+    menu_header "RESET ZIVPN QUOTA"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    sed -i "s/^Used.*/Used     : 0 GB/" $INSTALL_DIR/zivpn/$user
+    echo -e " ${GREEN}✓ Quota reset for '$user'${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_limit_ip() {
+    menu_header "CHANGE LIMIT IP — ZIVPN"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    cur=$(grep "Max IP" $INSTALL_DIR/zivpn/$user | cut -d':' -f2 | xargs)
+    echo -e " Current Max IP: ${YELLOW}$cur${NC}"
+    read -p " New Max IP (1-10): " maxip
+    [[ ! "$maxip" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid!${NC}"; sleep 2; return; }
+    sed -i "s/Max IP.*/Max IP   : $maxip/" $INSTALL_DIR/zivpn/$user
+    echo -e " ${GREEN}✓ Max IP updated to $maxip for $user${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_limit_quota() {
+    menu_header "CHANGE QUOTA — ZIVPN"
+    read -p " Username: " user
+    [ ! -f "$INSTALL_DIR/zivpn/$user" ] && { echo -e "${RED}User not found!${NC}"; sleep 2; return; }
+    cur=$(grep "^Quota" $INSTALL_DIR/zivpn/$user | cut -d':' -f2 | xargs)
+    echo -e " Current Quota: ${YELLOW}$cur${NC}"
+    read -p " New Quota (GB): " quota
+    [[ ! "$quota" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid!${NC}"; sleep 2; return; }
+    sed -i "s/^Quota.*/Quota    : $quota GB/" $INSTALL_DIR/zivpn/$user
+    echo -e " ${GREEN}✓ Quota updated to $quota GB for $user${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_change_port() {
+    menu_header "CHANGE ZIVPN PORT"
+    cur=$(cat $INSTALL_DIR/config/zivpn_port 2>/dev/null || echo "5667")
+    echo -e " Current port: ${YELLOW}$cur (UDP)${NC}"
+    read -p " New UDP port: " port
+    [[ ! "$port" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid port!${NC}"; sleep 2; return; }
+    echo "$port" > $INSTALL_DIR/config/zivpn_port
+    # Update config file
+    [ -f /etc/zivpn/server.conf ] && \
+        sed -i "s/^port.*/port = $port/" /etc/zivpn/server.conf 2>/dev/null
+    # Update UDP port in udpgw / iptables rule if needed
+    ufw allow "$port/udp" 2>/dev/null
+    systemctl restart zivpn 2>/dev/null
+    echo -e " ${GREEN}✓ ZiVPN port changed to $port/UDP${NC}"
+    menu_footer; press_enter
+}
+
+_zivpn_expiring() {
+    menu_header "ZIVPN USERS EXPIRING WITHIN 3 DAYS"
+    echo ""
+    today=$(date +%s)
+    limit=$((today + 259200))
+    found=0
+    for u in $(ls $INSTALL_DIR/zivpn/ 2>/dev/null); do
+        exp_str=$(grep "Expires" $INSTALL_DIR/zivpn/$u 2>/dev/null | cut -d':' -f2 | xargs)
+        [ -z "$exp_str" ] && continue
+        exp_ts=$(date -d "$exp_str" +%s 2>/dev/null) || continue
+        if [ $exp_ts -le $limit ] && [ $exp_ts -ge $today ]; then
+            days_left=$(( (exp_ts - today) / 86400 ))
+            echo -e "  ${WHITE}$u${NC} — Expires: ${RED}$exp_str${NC} (${days_left} days left)"
+            found=1
+        fi
+    done
+    [ $found -eq 0 ] && echo -e "  ${GREEN}No ZiVPN users expiring within 3 days ✓${NC}"
+    echo ""
+    menu_footer; press_enter
+}
+
+# ── ZiVPN user management helpers ────────────────────────────
+_zivpn_add_user() {
+    local user="$1" pass="$2"
+    local conf="/etc/zivpn/users.conf"
+    [ ! -f "$conf" ] && touch "$conf"
+    if grep -q "^${user}:" "$conf" 2>/dev/null; then
+        sed -i "s|^${user}:.*|${user}:${pass}:active|" "$conf"
+    else
+        echo "${user}:${pass}:active" >> "$conf"
+    fi
+    systemctl restart zivpn 2>/dev/null
+}
+
+_zivpn_del_user() {
+    local user="$1"
+    sed -i "/^${user}:/d" /etc/zivpn/users.conf 2>/dev/null
+    systemctl restart zivpn 2>/dev/null
+}
+
+_zivpn_block_user() {
+    local user="$1"
+    sed -i "s|^${user}:\(.*\):active|${user}:\1:blocked|" /etc/zivpn/users.conf 2>/dev/null
+    systemctl restart zivpn 2>/dev/null
+}
+
+_zivpn_unblock_user() {
+    local user="$1"
+    sed -i "s|^${user}:\(.*\):blocked|${user}:\1:active|" /etc/zivpn/users.conf 2>/dev/null
+    systemctl restart zivpn 2>/dev/null
+}
+
+# ── ZiVPN install ─────────────────────────────────────────────
+_install_zivpn_full() {
+    _log_step "تنصيب ZiVPN (UDP 5667)..."
+    apt-get install -y build-essential cmake git libssl-dev \
+        libsodium-dev libudns-dev >> "$LOG_FILE" 2>&1
+
+    # ── Clone and build zivpn ─────────────────────────────────
+    if ! command -v zivpn &>/dev/null; then
+        cd /tmp
+        rm -rf zivpn
+        git clone https://github.com/zivpn/zivpn.git >> "$LOG_FILE" 2>&1 || {
+            # Fallback: build a simple UDP tunnel server
+            _log_step "زivpn غير متاح — تنصيب udptunnel بديل..."
+            apt-get install -y udptunnel 2>/dev/null >> "$LOG_FILE" 2>&1
+        }
+        if [ -d /tmp/zivpn ]; then
+            cd /tmp/zivpn
+            cmake . >> "$LOG_FILE" 2>&1
+            make >> "$LOG_FILE" 2>&1
+            [ -f bin/zivpn ] && cp bin/zivpn /usr/local/bin/zivpn
+            cd /root
+        fi
+    fi
+
+    # ── Create config ─────────────────────────────────────────
+    mkdir -p /etc/zivpn
+    touch /etc/zivpn/users.conf
+    echo "5667" > $INSTALL_DIR/config/zivpn_port
+
+    cat > /etc/zivpn/server.conf <<'EOF'
+# ZiVPN Server Config
+port = 5667
+protocol = udp
+auth = file
+users_file = /etc/zivpn/users.conf
+max_clients = 100
+log = /var/log/zivpn.log
+EOF
+
+    # ── Open UDP port ─────────────────────────────────────────
+    ufw allow 5667/udp >> "$LOG_FILE" 2>&1
+    iptables -I INPUT -p udp --dport 5667 -j ACCEPT 2>/dev/null
+
+    # ── Systemd service ───────────────────────────────────────
+    cat > /etc/systemd/system/zivpn.service <<'ZEOF'
+[Unit]
+Description=ZiVPN UDP Service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/zivpn -c /etc/zivpn/server.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+ZEOF
+
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1
+    systemctl enable zivpn  >> "$LOG_FILE" 2>&1
+    systemctl start  zivpn  >> "$LOG_FILE" 2>&1
+    _log_ok "ZiVPN (UDP port 5667)"
+}
+
 # ██████  SETTINGS MENU
 # ══════════════════════════════════════════════════════════════
 settings_menu() {
@@ -1623,6 +2730,7 @@ settings_menu() {
         echo -e "${BLUE}║${NC}  ${WHITE}[8]${NC}  CHANGE UUID OR PASSWORD ACCOUNT VPN ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}  ${WHITE}[9]${NC}  ROUTINGS TRAFFIC XRAY               ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}  ${WHITE}[10]${NC} WARP CLOUDFLARE                     ${BLUE}║${NC}"
+        echo -e "${BLUE}║${NC}  ${GREEN}[29]${NC} CLOUDFLARE DNS SETUP / UPDATE       ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC} ${PURPLE}► BACKUP & RESTORE${NC}                       ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}  ${WHITE}[11]${NC} AUTOBACKUP VIA BOT TELEGRAM         ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}  ${WHITE}[12]${NC} AUTOSEND CREATED VPN VIA BOT        ${BLUE}║${NC}"
@@ -1647,7 +2755,7 @@ settings_menu() {
         echo -e "${BLUE}║${NC}  ${WHITE}[28]${NC} CHECK USAGE OF RAM                  ${BLUE}║${NC}"
         echo -e "${BLUE}║${NC}  ${RED}[0]${NC}  Back to Main Menu                   ${BLUE}║${NC}"
         echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-        read -p "Please select an option [0-28]: " opt
+        read -p "Please select an option [0-29]: " opt
         case $opt in
             1)  _s_activate_limit ;;
             2)  _s_argo_setup ;;
@@ -1677,10 +2785,43 @@ settings_menu() {
             26) _s_view_protocols ;;
             27) _s_view_bandwidth ;;
             28) _s_check_ram ;;
+            29) _s_cf_dns ;;
             0) break ;;
             *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
         esac
     done
+}
+
+_s_cf_dns() {
+    menu_header "CLOUDFLARE DNS SETUP / UPDATE"
+    echo ""
+    if [ -f "$INSTALL_DIR/config/cloudflare" ]; then
+        source "$INSTALL_DIR/config/cloudflare"
+        echo -e " ${CYAN}الإعداد الحالي:${NC}"
+        echo -e "  الدومين  : ${YELLOW}$CF_SUBDOMAIN${NC}"
+        echo -e "  Zone Name: ${YELLOW}$CF_ZONE_NAME${NC}"
+        echo -e "  Zone ID  : ${YELLOW}$CF_ZONE_ID${NC}"
+        echo ""
+        echo -e " ${LGREEN}[1]${NC} تحديث IP السيرفر في Cloudflare"
+        echo -e " ${LGREEN}[2]${NC} إعادة الإعداد (تغيير الدومين أو التوكن)"
+        echo -e " ${RED}[0]${NC} رجوع"
+        echo ""
+        read -p " اختر [0-2]: " c
+        case $c in
+            1) _cf_update_record ;;
+            2) _cf_do_setup ;;
+            0) return ;;
+        esac
+    else
+        echo -e " ${YELLOW}لا توجد بيانات Cloudflare محفوظة بعد.${NC}"
+        echo ""
+        echo -e " ${LGREEN}[1]${NC} إعداد Cloudflare الآن"
+        echo -e " ${RED}[0]${NC} رجوع"
+        read -p " اختر [0-1]: " c
+        [[ "$c" == "1" ]] && _cf_do_setup
+    fi
+    menu_footer
+    press_enter
 }
 
 _s_activate_limit() {
@@ -2086,6 +3227,8 @@ services_toggle_menu() {
         printf " 13. Service BadVPN UDPGW              (status: $(_st badvpn))\n"
         printf " 14. Service Nginx                     (status: $(_st nginx))\n"
         printf " 15. Service Fail2Ban                  (status: $(_st fail2ban))\n"
+        printf " 16. Service Falcon Proxy              (status: $(_st falcon-proxy))\n"
+        printf " 17. Service ZiVPN UDP                 (status: $(_st zivpn))\n"
         echo ""
         echo -e " ${RED}0.  Exit${NC}"
         echo -e "${BLUE}──────────────────────────────────────────${NC}"
@@ -2121,6 +3264,8 @@ services_toggle_menu() {
             13) _tog "badvpn"         "BadVPN UDPGW" ;;
             14) _tog "nginx"          "Nginx" ;;
             15) _tog "fail2ban"       "Fail2Ban" ;;
+            16) _tog "falcon-proxy"    "Falcon Proxy" ;;
+            17) _tog "zivpn"          "ZiVPN UDP" ;;
             0) break ;;
             *) echo -e "${RED}Invalid!${NC}"; sleep 1 ;;
         esac
@@ -2162,6 +3307,8 @@ status_services() {
     _chk rc-local        "RC-LOCAL"
     _chk vnstat          "VNSTAT"
     _chk warp-svc        "CLOUDFLARE WARP"
+    _chk falcon-proxy    "FALCON PROXY"
+    _chk zivpn           "ZIVPN UDP"
 
     echo ""
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
